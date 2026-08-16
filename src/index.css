@@ -1,0 +1,43 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  color: #ffffff;
+  font-family: "Times New Roman", Times, Georgia, serif;
+  /* Dark base (#2c0f4b) with depth from purple (#8a12ff) and magenta (#d000ff). */
+  background-color: #2c0f4b;
+  background-image:
+    radial-gradient(1200px 700px at 12% -10%, rgba(138, 18, 255, 0.55), transparent 60%),
+    radial-gradient(1000px 600px at 100% 0%, rgba(208, 0, 255, 0.35), transparent 55%),
+    radial-gradient(900px 900px at 50% 120%, rgba(138, 18, 255, 0.3), transparent 60%),
+    linear-gradient(160deg, #2c0f4b 0%, #1e0a37 100%);
+  background-attachment: fixed;
+}
+
+/* Interactive elements use the palette. */
+input[type="range"] {
+  accent-color: #d000ff;
+}
+input[type="checkbox"] {
+  accent-color: #ff9f1c;
+}
+select,
+input[type="text"] {
+  color: #ffffff;
+  font-family: "Times New Roman", Times, Georgia, serif;
+}
+option {
+  color: #2c0f4b;
+}
+
+summary::-webkit-details-marker {
+  display: none;
+}
