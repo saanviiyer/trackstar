@@ -1,0 +1,12 @@
+node_modules
+dist
+.env
+.env.*
+!.env.example
+.DS_Store
+*.log
+
+# Vendored at install time by scripts/ (postinstall). Not source.
+public/wasm
+public/models/hand_landmarker.task
+*.tsbuildinfo
