@@ -1,7 +1,7 @@
 // deejai.ts - client for the deejai FastAPI producer backend.
 //
 // The backend is the offline Python audio engine wrapped in a small REST API
-// (see deejai/app/server.py). deesynth's Producer mode talks to it to run
+// (see deejai/app/server.py). Trackstar's Producer mode talks to it to run
 // natural-language producer commands ("add a lofi beat"), then fetches the
 // rendered stem WAV files, decodes them into AudioBuffers, and drops them into
 // the shared mixer alongside the live handsynth loops.

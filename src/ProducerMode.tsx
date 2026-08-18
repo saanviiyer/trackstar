@@ -20,6 +20,13 @@ import { LandmarkSmoother } from "./lib/smoothing";
 import { drawHand } from "./lib/draw";
 import { ProducerMixer, type MixerTrackState } from "./lib/producerMixer";
 import {
+  cleanProjectName,
+  clearAutosave,
+  loadAutosave,
+  saveAutosave,
+  type TrackstarProject,
+} from "./lib/projectStore";
+import {
   deejaiBase,
   probe,
   sendCommand,
@@ -127,11 +134,67 @@ export default function ProducerMode() {
   const [aiBusy, setAiBusy] = useState<boolean>(false);
   const [aiError, setAiError] = useState<string>("");
   const loadedStemFilesRef = useRef<Set<string>>(new Set());
+  const pendingProjectRef = useRef<TrackstarProject | null>(null);
+  const restoreCompleteRef = useRef(false);
+
+  const [projectName, setProjectName] = useState("Untitled project");
+  const [projectLoaded, setProjectLoaded] = useState(false);
+  const [saveStatus, setSaveStatus] = useState("Loading autosave…");
+  const [importingAudio, setImportingAudio] = useState(false);
 
   const [selection, setSelection] = useState<Selection | null>(null);
   const [handCount, setHandCount] = useState<number>(0);
 
   const base = useMemo(() => deejaiBase(), []);
+
+  const restoreProjectIfReady = useCallback(() => {
+    if (restoreCompleteRef.current) return;
+    const saved = pendingProjectRef.current;
+    const mixer = mixerRef.current;
+    if (!saved || !mixer) return;
+    try {
+      mixer.restoreSnapshot(saved.mixer);
+      setProjectName(cleanProjectName(saved.name));
+      setArpBpm(Math.max(60, Math.min(200, Math.round(saved.bpm))));
+      setLoopBars([1, 2, 4, 8].includes(saved.bars) ? saved.bars : 2);
+      setSaveStatus(`Restored ${saved.mixer.tracks.length} track${saved.mixer.tracks.length === 1 ? "" : "s"}`);
+    } catch {
+      pendingProjectRef.current = null;
+      setSaveStatus("Saved project was damaged; started a fresh project");
+    } finally {
+      restoreCompleteRef.current = true;
+    }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    loadAutosave()
+      .then((saved) => {
+        if (cancelled) return;
+        pendingProjectRef.current = saved;
+        setProjectLoaded(true);
+        if (!saved) {
+          restoreCompleteRef.current = true;
+          setSaveStatus("Autosave ready");
+        } else {
+          setProjectName(cleanProjectName(saved.name));
+          setArpBpm(Math.max(60, Math.min(200, Math.round(saved.bpm))));
+          setLoopBars([1, 2, 4, 8].includes(saved.bars) ? saved.bars : 2);
+          setSaveStatus("Enable sound to restore saved audio");
+          restoreProjectIfReady();
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          restoreCompleteRef.current = true;
+          setProjectLoaded(true);
+          setSaveStatus("Autosave unavailable in this browser");
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [restoreProjectIfReady]);
 
   // Latest instrument config for the rAF loop.
   const cfgRef = useRef({ tonic, scale, octave, extension, twoHand, arpOn, latchOn });
@@ -326,11 +389,14 @@ export default function ProducerMode() {
         };
         mixerRef.current = mixer;
       }
+      restoreProjectIfReady();
       setPhase("loading-model");
-      landmarkerRef.current = await createHandLandmarker({
-        numHands: 2,
-        onStatus: setStatus,
-      });
+      if (!landmarkerRef.current) {
+        landmarkerRef.current = await createHandLandmarker({
+          numHands: 2,
+          onStatus: setStatus,
+        });
+      }
       setPhase("requesting-camera");
       setStatus("Requesting camera...");
       let stream: MediaStream;
@@ -354,7 +420,37 @@ export default function ProducerMode() {
       setPhase("error");
       setErrorMsg(err instanceof Error ? err.message : String(err));
     }
-  }, [loop, volume, presetName, arpBpm, drumPattern, drumsOn, loopBars, recordSource]);
+  }, [loop, volume, presetName, arpBpm, drumPattern, drumsOn, loopBars, recordSource, restoreProjectIfReady]);
+
+  useEffect(() => {
+    if (!projectLoaded || !restoreCompleteRef.current || !mixerRef.current) return;
+    setSaveStatus("Saving…");
+    const timer = window.setTimeout(() => {
+      const mixer = mixerRef.current;
+      if (!mixer) return;
+      saveAutosave({
+        version: 1,
+        name: cleanProjectName(projectName),
+        savedAt: new Date().toISOString(),
+        bpm: arpBpm,
+        bars: loopBars,
+        mixer: mixer.createSnapshot(),
+      })
+        .then(() => setSaveStatus("Saved locally"))
+        .catch(() => setSaveStatus("Autosave failed — export important tracks"));
+    }, 700);
+    return () => window.clearTimeout(timer);
+  }, [tracks, projectName, arpBpm, loopBars, projectLoaded]);
+
+  useEffect(() => {
+    const warn = (event: BeforeUnloadEvent) => {
+      if (!recording) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [recording]);
 
   const getSharedMic = useCallback(async (): Promise<MediaStream> => {
     if (micStreamRef.current) return micStreamRef.current;
@@ -401,12 +497,51 @@ export default function ProducerMode() {
     setMixerError("");
     try {
       const bytes = await m.exportMix(exportCycles);
-      if (bytes) downloadBytes(bytes, `deesynth-mix-${stamp()}.wav`);
+      if (bytes) downloadBytes(bytes, `trackstar-mix-${stamp()}.wav`);
       else setMixerError("Nothing to export yet.");
     } catch (err) {
       setMixerError(err instanceof Error ? err.message : "Export failed.");
     }
   }, [exportCycles]);
+
+  const importAudio = useCallback(async (file: File | undefined) => {
+    if (!file) return;
+    const mixer = mixerRef.current;
+    const audioCtx = synthRef.current.getContext();
+    if (!mixer || !audioCtx) {
+      setMixerError("Enable camera & sound before importing audio.");
+      return;
+    }
+    if (file.size > 100 * 1024 * 1024) {
+      setMixerError("Audio files must be 100 MB or smaller.");
+      return;
+    }
+    setMixerError("");
+    setImportingAudio(true);
+    try {
+      const buffer = await audioCtx.decodeAudioData(await file.arrayBuffer());
+      mixer.addImportedTrack(buffer, file.name.replace(/\.[^.]+$/, ""));
+    } catch {
+      setMixerError("This audio file could not be decoded. Try WAV, MP3, M4A, or OGG.");
+    } finally {
+      setImportingAudio(false);
+    }
+  }, []);
+
+  const newProject = useCallback(async () => {
+    if (tracks.length > 0 && !window.confirm("Clear every track and start a new project? Export anything you want to keep first.")) return;
+    mixerRef.current?.clearAll();
+    pendingProjectRef.current = null;
+    restoreCompleteRef.current = true;
+    setProjectName("Untitled project");
+    loadedStemFilesRef.current.clear();
+    try {
+      await clearAutosave();
+      setSaveStatus("New project");
+    } catch {
+      setSaveStatus("Could not clear local autosave");
+    }
+  }, [tracks.length]);
 
   // Run a natural-language producer command against deejai and pull in the new
   // AI backing stems as mixer tracks.
@@ -600,6 +735,29 @@ export default function ProducerMode() {
 
         {/* MIXER */}
         <div className="mt-4 rounded-2xl border border-magenta/30 bg-purple/15 p-4">
+          <div className="mb-4 flex flex-wrap items-end gap-2 border-b border-magenta/20 pb-3">
+            <label className="min-w-[180px] flex-1 text-xs text-white/60">
+              Project name
+              <input
+                type="text"
+                value={projectName}
+                maxLength={80}
+                onChange={(event) => setProjectName(event.target.value)}
+                onBlur={() => setProjectName((name) => cleanProjectName(name))}
+                className="mt-1 w-full rounded-lg border border-purple/50 bg-purple/25 px-2 py-1.5 text-sm"
+              />
+            </label>
+            <button
+              type="button"
+              onClick={newProject}
+              className="rounded-lg bg-purple/35 px-3 py-1.5 text-sm hover:bg-magenta/40"
+            >
+              New project
+            </button>
+            <span className="w-full text-xs text-white/45" role="status" aria-live="polite">
+              {saveStatus}. Audio and mixer settings stay in this browser.
+            </span>
+          </div>
           <div className="mb-3 flex items-center justify-between">
             <h2 className="text-sm font-semibold uppercase tracking-wide text-white/70">
               Mixer <span className="text-white/40">({tracks.length})</span>
@@ -620,7 +778,11 @@ export default function ProducerMode() {
                 {playing ? "Stop all" : "Play all"}
               </button>
               <button
-                onClick={() => mixerRef.current?.clearAll()}
+                onClick={() => {
+                  if (window.confirm("Clear all mixer tracks? This cannot be undone.")) {
+                    mixerRef.current?.clearAll();
+                  }
+                }}
                 disabled={tracks.length === 0}
                 className={`rounded-lg px-3 py-1.5 text-sm font-medium transition ${
                   tracks.length === 0
@@ -675,6 +837,25 @@ export default function ProducerMode() {
               />
               Count-in
             </label>
+            <label
+              className={`cursor-pointer rounded-lg px-3 py-1.5 font-medium transition ${
+                importingAudio
+                  ? "cursor-wait bg-purple/25 text-white/50"
+                  : "bg-purple/45 hover:bg-magenta/40"
+              }`}
+            >
+              {importingAudio ? "Importing…" : "Import audio"}
+              <input
+                type="file"
+                accept="audio/*,.wav,.mp3,.m4a,.aac,.ogg,.flac"
+                disabled={importingAudio}
+                onChange={(event) => {
+                  void importAudio(event.target.files?.[0]);
+                  event.target.value = "";
+                }}
+                className="sr-only"
+              />
+            </label>
           </div>
 
           {/* Track list */}
@@ -691,8 +872,17 @@ export default function ProducerMode() {
                   className="rounded-lg border border-magenta/20 bg-purple/10 p-2"
                 >
                   <div className="flex items-center justify-between text-sm">
-                    <span className="text-white/90">
-                      {t.name}{" "}
+                    <span className="min-w-0 flex-1 text-white/90">
+                      <input
+                        aria-label={`Rename ${t.name}`}
+                        value={t.name}
+                        maxLength={80}
+                        onChange={(event) => mixerRef.current?.renameTrack(t.id, event.target.value)}
+                        onBlur={() => {
+                          if (!t.name.trim()) mixerRef.current?.renameTrack(t.id, `Track ${t.id}`);
+                        }}
+                        className="w-full min-w-0 border-0 bg-transparent p-0 text-sm text-white/90 outline-none focus:ring-1 focus:ring-yellow"
+                      />{" "}
                       <span className="text-xs text-white/40">
                         ({t.kind === "stem" ? t.role : t.source})
                       </span>
@@ -700,6 +890,8 @@ export default function ProducerMode() {
                     <div className="flex items-center gap-1.5">
                       <button
                         onClick={() => mixerRef.current?.setMute(t.id, !t.muted)}
+                        aria-label={`${t.muted ? "Unmute" : "Mute"} ${t.name}`}
+                        aria-pressed={t.muted}
                         className={`rounded px-2 py-0.5 text-xs font-medium ${
                           t.muted
                             ? "bg-orange text-ink"
@@ -710,6 +902,8 @@ export default function ProducerMode() {
                       </button>
                       <button
                         onClick={() => mixerRef.current?.setSolo(t.id, !t.solo)}
+                        aria-label={`${t.solo ? "Unsolo" : "Solo"} ${t.name}`}
+                        aria-pressed={t.solo}
                         className={`rounded px-2 py-0.5 text-xs font-medium ${
                           t.solo
                             ? "bg-yellow text-ink"
@@ -719,16 +913,25 @@ export default function ProducerMode() {
                         S
                       </button>
                       <button
+                        aria-label={`Download ${t.name} as WAV`}
                         onClick={() => {
                           const b = mixerRef.current?.getTrackWav(t.id);
-                          if (b) downloadBytes(b, `deesynth-${t.role}-${t.id}-${stamp()}.wav`);
+                          if (b) downloadBytes(b, `trackstar-${t.role}-${t.id}-${stamp()}.wav`);
                         }}
                         className="rounded bg-purple/25 px-2 py-0.5 text-xs text-white/80 hover:bg-magenta/40"
                       >
                         Save
                       </button>
                       <button
+                        onClick={() => mixerRef.current?.duplicateTrack(t.id)}
+                        aria-label={`Duplicate ${t.name}`}
+                        className="rounded bg-purple/25 px-2 py-0.5 text-xs text-white/80 hover:bg-magenta/40"
+                      >
+                        Copy
+                      </button>
+                      <button
                         onClick={() => mixerRef.current?.deleteTrack(t.id)}
+                        aria-label={`Delete ${t.name}`}
                         className="rounded bg-purple/25 px-2 py-0.5 text-xs text-white/80 hover:bg-magenta/40"
                       >
                         Del
@@ -738,6 +941,7 @@ export default function ProducerMode() {
                   <div className="mt-1 flex items-center gap-2">
                     <span className="w-8 text-xs text-white/50">Vol</span>
                     <input
+                      aria-label={`${t.name} volume`}
                       type="range"
                       min={0}
                       max={1}
@@ -752,6 +956,7 @@ export default function ProducerMode() {
                   <div className="mt-1 flex items-center gap-2">
                     <span className="w-8 text-xs text-white/50">Pan</span>
                     <input
+                      aria-label={`${t.name} pan`}
                       type="range"
                       min={-1}
                       max={1}
@@ -800,7 +1005,7 @@ export default function ProducerMode() {
           {!started && (
             <p className="mt-2 text-xs text-white/40">Enable camera &amp; sound first.</p>
           )}
-          {mixerError && <p className="mt-1 text-xs text-orange">{mixerError}</p>}
+          {mixerError && <p className="mt-1 text-xs text-orange" role="alert">{mixerError}</p>}
           <p className="mt-2 text-xs text-white/55">
             Loops and AI stems share one AudioContext and start together on Play
             all. Export bounces the whole mix (with pan) to a stereo WAV.
@@ -846,7 +1051,7 @@ export default function ProducerMode() {
                 {UVICORN_CMD}
               </code>
               <p className="mt-2 text-xs text-white/55">
-                deesynth talks to it at <code>{base}</code> (set{" "}
+                Trackstar talks to it at <code>{base}</code> (set{" "}
                 <code>VITE_DEEJAI_URL</code> to change). Then:
               </p>
               <button
@@ -923,7 +1128,7 @@ export default function ProducerMode() {
               </p>
             </>
           )}
-          {aiError && <p className="mt-2 text-xs text-orange">{aiError}</p>}
+          {aiError && <p className="mt-2 text-xs text-orange" role="alert">{aiError}</p>}
         </section>
 
         {/* Instrument controls */}

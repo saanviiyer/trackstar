@@ -172,7 +172,7 @@ type Phase =
 const HAND_COLORS = ["#ffd400", "#d000ff"]; // play = yellow, modifier = magenta
 
 // Simple mode: the full handsynth experience, copied verbatim from the
-// handsynth project and rendered as one of deesynth's two top-level modes.
+// handsynth project and rendered as one of Trackstar's two top-level modes.
 export default function SimpleMode() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);

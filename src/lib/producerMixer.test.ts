@@ -4,6 +4,7 @@ import {
   exportSpanSec,
   exportFrames,
   encodeWavStereo,
+  sanitizeTrackName,
 } from "./producerMixer";
 import { effectiveGain } from "./vocalLooper";
 
@@ -14,6 +15,14 @@ describe("clampPan", () => {
     expect(clampPan(5)).toBe(1);
     expect(clampPan(-5)).toBe(-1);
     expect(clampPan(NaN)).toBe(0);
+  });
+});
+
+describe("sanitizeTrackName", () => {
+  it("normalizes user labels and rejects empty names", () => {
+    expect(sanitizeTrackName("  Lead\u0000 vocal  ")).toBe("Lead  vocal");
+    expect(sanitizeTrackName("", "Track 3")).toBe("Track 3");
+    expect(sanitizeTrackName("x".repeat(100))).toHaveLength(80);
   });
 });
 
