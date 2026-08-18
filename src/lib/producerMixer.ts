@@ -1,4 +1,4 @@
-// producerMixer.ts - the multitrack mixer that powers deesynth's Producer mode.
+// producerMixer.ts - the multitrack mixer that powers Trackstar's Producer mode.
 //
 // It unifies two kinds of tracks in ONE shared AudioContext (the handsynth
 // Synth's context):
@@ -52,6 +52,25 @@ export interface MixerConfig {
   free: boolean;
 }
 
+export interface SerializedMixerTrack {
+  name: string;
+  kind: TrackKind;
+  role: string;
+  source: RecordSource | "ai";
+  muted: boolean;
+  solo: boolean;
+  volume: number;
+  pan: number;
+  sampleRate: number;
+  channels: ArrayBuffer[];
+}
+
+export interface MixerProjectSnapshot {
+  version: 1;
+  loopDurationSec: number;
+  tracks: SerializedMixerTrack[];
+}
+
 // ---------------------------------------------------------------------------
 // Pure helpers (unit tested)
 // ---------------------------------------------------------------------------
@@ -60,6 +79,11 @@ export interface MixerConfig {
 export function clampPan(pan: number): number {
   if (Number.isNaN(pan)) return 0;
   return Math.max(-1, Math.min(1, pan));
+}
+
+export function sanitizeTrackName(name: string, fallback = "Untitled track"): string {
+  const clean = name.replace(/[\u0000-\u001f]/g, " ").trim().slice(0, 80);
+  return clean || fallback;
 }
 
 /**
@@ -190,7 +214,7 @@ export class ProducerMixer {
   }
 
   get isRecording(): boolean {
-    return this.recording;
+    return this.recording || this.countInTimer !== null;
   }
   get isPlaying(): boolean {
     return this.playing;
@@ -253,6 +277,7 @@ export class ProducerMixer {
     const gain = this.ctx.createGain();
     const panner = this.ctx.createStereoPanner();
     panner.pan.value = clampPan(pan);
+    gain.gain.value = 0.9;
     gain.connect(panner);
     panner.connect(this.output);
     const track: MixerTrack = {
@@ -297,6 +322,21 @@ export class ProducerMixer {
     return this.getStates().find((s) => s.id === track.id)!;
   }
 
+  /** Add an audio file chosen by the user as a reusable backing track. */
+  addImportedTrack(buffer: AudioBuffer, name: string): MixerTrackState {
+    const safeName = sanitizeTrackName(name, `Imported ${this.nextId}`);
+    const track = this.makeTrack(buffer, safeName, "stem", "imported", "ai", 0);
+    if (this.playing) {
+      const startAt = this.loopDur > 0
+        ? nextLoopBoundary(this.ctx.currentTime + 0.05, this.loopStart, this.loopDur)
+        : this.ctx.currentTime + 0.05;
+      this.startTrack(track, startAt);
+      this.applyMix();
+    }
+    this.onChange?.();
+    return this.getStates().find((state) => state.id === track.id)!;
+  }
+
   private startTrack(track: MixerTrack, when: number): void {
     const node = this.ctx.createBufferSource();
     node.buffer = track.buffer;
@@ -325,7 +365,7 @@ export class ProducerMixer {
   // --- recording a live loop (ported from the handsynth looper) ---
 
   arm(countInBars: number): void {
-    if (this.recording || !this.canRecord()) return;
+    if (this.recording || this.countInTimer || !this.canRecord()) return;
     const barDur = (60 / this.cfg.bpm) * BEATS_PER_BAR;
     const clickBars = Math.max(0, Math.floor(countInBars));
     if (clickBars > 0) {
@@ -337,9 +377,13 @@ export class ProducerMixer {
         }
       }
       this.countInTimer = setTimeout(
-        () => this.beginCapture(),
+        () => {
+          this.countInTimer = null;
+          this.beginCapture();
+        },
         clickBars * barDur * 1000
       );
+      this.onChange?.();
     } else {
       this.beginCapture();
     }
@@ -398,7 +442,6 @@ export class ProducerMixer {
   }
 
   stopRecording(): void {
-    if (!this.recording) return;
     if (this.countInTimer) {
       clearTimeout(this.countInTimer);
       this.countInTimer = null;
@@ -407,6 +450,7 @@ export class ProducerMixer {
       this.onChange?.();
       return;
     }
+    if (!this.recording) return;
     if (!this.capture) {
       const total = this.freeChunks.reduce((a, c) => a + c.length, 0);
       const buf = new Float32Array(Math.max(1, total));
@@ -564,6 +608,100 @@ export class ProducerMixer {
     }
   }
 
+  renameTrack(id: number, name: string): void {
+    const t = this.tracks.find((x) => x.id === id);
+    if (t) {
+      t.name = name.replace(/[\u0000-\u001f]/g, " ").slice(0, 80);
+      this.onChange?.();
+    }
+  }
+
+  duplicateTrack(id: number): MixerTrackState | null {
+    const source = this.tracks.find((x) => x.id === id);
+    if (!source) return null;
+    const copy = this.makeTrack(
+      source.buffer,
+      `${source.name} copy`.slice(0, 80),
+      source.kind,
+      source.role,
+      source.source,
+      source.pan
+    );
+    copy.volume = source.volume;
+    copy.muted = source.muted;
+    copy.solo = source.solo;
+    if (this.playing) {
+      const startAt = this.loopDur > 0
+        ? nextLoopBoundary(this.ctx.currentTime + 0.05, this.loopStart, this.loopDur)
+        : this.ctx.currentTime + 0.05;
+      this.startTrack(copy, startAt);
+      this.applyMix();
+    }
+    this.onChange?.();
+    return this.getStates().find((state) => state.id === copy.id) ?? null;
+  }
+
+  createSnapshot(): MixerProjectSnapshot {
+    return {
+      version: 1,
+      loopDurationSec: this.loopDur,
+      tracks: this.tracks.map((track) => ({
+        name: track.name,
+        kind: track.kind,
+        role: track.role,
+        source: track.source,
+        muted: track.muted,
+        solo: track.solo,
+        volume: track.volume,
+        pan: track.pan,
+        sampleRate: track.buffer.sampleRate,
+        channels: Array.from({ length: track.buffer.numberOfChannels }, (_, channel) => {
+          const samples = track.buffer.getChannelData(channel);
+          return samples.slice().buffer;
+        }),
+      })),
+    };
+  }
+
+  restoreSnapshot(snapshot: MixerProjectSnapshot): void {
+    if (snapshot.version !== 1 || !Array.isArray(snapshot.tracks)) {
+      throw new Error("Unsupported Trackstar project format.");
+    }
+    this.clearAll();
+    for (const saved of snapshot.tracks) {
+      if (
+        !saved ||
+        !Array.isArray(saved.channels) ||
+        !saved.channels.length ||
+        !saved.channels.every((channel) => channel instanceof ArrayBuffer) ||
+        !Number.isFinite(saved.sampleRate) ||
+        saved.sampleRate < 8000 ||
+        saved.sampleRate > 192000
+      ) continue;
+      const arrays = saved.channels.map((bytes) => new Float32Array(bytes));
+      const length = Math.min(...arrays.map((samples) => samples.length));
+      if (length < 1) continue;
+      const buffer = this.ctx.createBuffer(arrays.length, length, saved.sampleRate);
+      arrays.forEach((samples, channel) => {
+        buffer.getChannelData(channel).set(samples.subarray(0, length));
+      });
+      const track = this.makeTrack(
+        buffer,
+        saved.name.trim().slice(0, 80) || `Track ${this.nextId}`,
+        saved.kind === "loop" ? "loop" : "stem",
+        saved.role || "imported",
+        saved.source,
+        saved.pan
+      );
+      track.muted = !!saved.muted;
+      track.solo = !!saved.solo;
+      track.volume = Math.max(0, Math.min(1, saved.volume));
+    }
+    this.loopDur = Math.max(0, snapshot.loopDurationSec || 0);
+    this.applyMix();
+    this.onChange?.();
+  }
+
   deleteTrack(id: number): void {
     const idx = this.tracks.findIndex((x) => x.id === id);
     if (idx < 0) return;
@@ -576,6 +714,7 @@ export class ProducerMixer {
       /* ignore */
     }
     this.tracks.splice(idx, 1);
+    if (!this.tracks.some((track) => track.kind === "loop")) this.loopDur = 0;
     if (this.tracks.length === 0) {
       this.loopStart = null;
       this.loopDur = 0;
@@ -609,11 +748,18 @@ export class ProducerMixer {
     return m;
   }
 
-  /** WAV bytes for one track (mono buffer -> mono WAV), for download. */
+  /** WAV bytes for one track; preserves stereo when the source has two channels. */
   getTrackWav(id: number): ArrayBuffer | null {
     const t = this.tracks.find((x) => x.id === id);
     if (!t) return null;
-    return encodeWavBytes(t.buffer.getChannelData(0), this.ctx.sampleRate);
+    if (t.buffer.numberOfChannels > 1) {
+      return encodeWavStereo(
+        t.buffer.getChannelData(0),
+        t.buffer.getChannelData(1),
+        t.buffer.sampleRate
+      );
+    }
+    return encodeWavBytes(t.buffer.getChannelData(0), t.buffer.sampleRate);
   }
 
   /**

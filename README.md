@@ -1,6 +1,6 @@
-# deesynth
+# Trackstar
 
-Hand-gesture synth and AI music producer in one web app. It fuses two projects
+Trackstar is a hand-gesture instrument and AI music studio in one web app. It fuses two projects
 behind a single top-level mode toggle:
 
 - **Simple mode** is the full handsynth instrument: play synth chords with
@@ -9,8 +9,9 @@ behind a single top-level mode toggle:
   multitrack mixer, and adds AI producer features powered by the deejai Python
   backend (natural-language commands like "add a lofi beat").
 
-Simple mode and the Producer mixer (record loops, volume/pan/mute/solo,
-play-all, export) work with **no backend and no keys**. Producer mode's AI
+Simple mode and the Producer studio (record and import loops, persistent
+projects, volume/pan/mute/solo, play-all, and export) work with **no backend
+and no keys**. Producer mode's AI
 features are the only part that needs the deejai backend running.
 
 ## Quick start
@@ -32,6 +33,13 @@ npm run build   # tsc -b + vite build, zero TS errors
 npm test        # vitest, 166 tests
 ```
 
+### Deploy
+
+Import this directory into Vercel or Netlify. Both hosts are configured to
+build and serve `dist/` as an SPA. Set `VITE_DEEJAI_URL` in the host's build
+environment to the HTTPS origin of a deployed deejai backend; without it, all
+non-AI instrument and mixer features continue to work.
+
 ## The two modes
 
 ### Simple mode
@@ -42,20 +50,23 @@ enable sound to start; the camera feed never leaves your device.
 
 > Note: Simple mode is a **copy of handsynth** (its `src/lib`, `Legend.tsx`,
 > `index.css`, `public/` assets, WASM/model scripts and config were copied into
-> deesynth verbatim, with the top-level `App` component rendered here as
+> Trackstar verbatim, with the top-level `App` component rendered here as
 > `SimpleMode`). Future changes in the original handsynth project would need to
-> be re-synced into deesynth by hand. This is an accepted MVP trade-off for
-> shipping both modes in one deployable app.
+> be re-synced into Trackstar by hand. This keeps the mature instrument isolated
+> from Producer-mode changes while both run in one application.
 
 ### Producer mode (the new work)
 
+- **Persistent projects.** The studio autosaves decoded audio and mixer state
+  to IndexedDB, restores it after sound is enabled, and preserves the project
+  name, BPM, bar length, volume, pan, mute, and solo settings.
 - **Live instrument -> mixer.** The same hand instrument plays live. Record its
   output (or your mic) into the mixer as loop tracks. Each track has volume,
-  pan, mute and solo. Play-all starts every track from one shared anchor so they
-  line up; Export bounces the whole mix (with pan) to a stereo WAV via an
-  OfflineAudioContext.
+  pan, mute and solo, plus rename, duplicate, download, and deletion. Existing
+  WAV/MP3/M4A/AAC/OGG/FLAC files can be decoded and imported. Play-all starts
+  every track from one shared anchor; Export bounces the mix to stereo WAV.
 - **AI producer (deejai).** Type a natural-language command ("add a lofi beat",
-  "add a warm pad backing in C", "add a trap beat"). deesynth runs it against a
+  "add a warm pad backing in C", "add a trap beat"). Trackstar runs it against a
   deejai session, fetches the returned stem WAVs, decodes them into
   AudioBuffers, and drops the backing stems (beat / pad / bass / arp) into the
   same mixer alongside your loops. It shows deejai's messages and the detected
@@ -79,7 +90,7 @@ adds pan, stem tracks and stereo export on top of proven logic.
 ## deejai backend (for Producer AI features)
 
 The AI features talk to the deejai FastAPI backend (the offline Python audio
-engine wrapped in a REST API). deesynth does not modify deejai.
+engine wrapped in a REST API). Trackstar does not modify deejai.
 
 Start it from the deejai project directory (deps: numpy, scipy, soundfile,
 pyloudnorm, fastapi, uvicorn):
@@ -88,7 +99,7 @@ pyloudnorm, fastapi, uvicorn):
 python3 -m uvicorn app.server:app --port 8000
 ```
 
-### How deesynth reaches it (CORS / proxy)
+### How Trackstar reaches it (CORS / proxy)
 
 - In dev, the Vite dev server proxies browser calls from `/deejai/...` to
   `http://localhost:8000` (see `vite.config.ts`), so there is no CORS setup.
@@ -108,27 +119,33 @@ Fully working:
 
 - Top-level Simple / Producer mode toggle.
 - Simple mode: the complete handsynth instrument.
-- Producer mixer: record live instrument (or mic) loops as tracks; per-track
-  volume, pan, mute, solo; save a track; delete; play-all / stop-all; clear.
+- Producer mixer: record live instrument (or mic) loops; import existing audio;
+  rename, duplicate, download, and delete tracks; volume, pan, mute, solo;
+  play-all / stop-all; confirmation-protected clear.
+- IndexedDB project autosave and restore, with corruption and quota failure
+  recovery that leaves the live studio usable.
 - Export: stereo WAV bounce of the whole mix (with pan) for N cycles.
 - deejai integration: create/reuse a session, run NL commands, fetch + decode
   stems, add backing stems (beat / pad / bass / arp) to the mixer; show
   messages and tempo / key / beat style.
 - Graceful degradation when the backend is down.
 
-MVP scope / trade-offs (documented, not silently trimmed):
+Deployment boundaries:
 
 - Producer mode ships a **compact** instrument control set (key, scale, octave,
   chord extension, sound preset, volume, shared tempo, two-hand, latch, arp,
   drums). The full sound-design / vocoder / effects panels live in Simple mode.
-- deejai integration is **LITE**: it auto-adds the AI backing stems (beat / pad
+- deejai integration auto-adds the AI backing stems (beat / pad
   / bass / arp). The demo vocal takes the engine balances are intentionally not
   imported as tracks (your own loops are the "takes"). Upload / align / lead /
-  bundle endpoints are not surfaced in this MVP.
+  bundle endpoints remain backend capabilities and are not exposed here.
 - Loops and stems start together on one anchor. Loops of different lengths (and
   a long stem vs short loops) share the start but are not resampled to a common
   bar length; set the instrument tempo to the project BPM for the tightest sync.
-- Simple mode is a verbatim copy of handsynth (see the note above).
+- Browser-local project storage does not sync across devices. Multi-device
+  accounts, sharing, collaboration, and server-side project backups require a
+  production identity/database/object-storage backend.
+- Simple mode is a maintained copy of handsynth (see the note above).
 
 ## Project layout
 

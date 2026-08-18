@@ -1,8 +1,8 @@
 {
-  "name": "deesynth",
+  "name": "trackstar",
   "private": true,
   "version": "0.1.0",
-  "description": "Hand-gesture synth plus AI music producer: Simple mode plays chords from webcam hand tracking, Producer mode records loops into a mixer and adds AI backing from the deejai backend.",
+  "description": "Trackstar is a hand-gesture instrument and AI music studio: perform, record loops, arrange tracks, and add AI-generated backing stems.",
   "type": "module",
   "scripts": {
     "dev": "vite",

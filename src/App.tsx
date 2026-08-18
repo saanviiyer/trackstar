@@ -1,6 +1,7 @@
-import { useState } from "react";
-import SimpleMode from "./SimpleMode";
-import ProducerMode from "./ProducerMode";
+import { lazy, Suspense, useState } from "react";
+
+const SimpleMode = lazy(() => import("./SimpleMode"));
+const ProducerMode = lazy(() => import("./ProducerMode"));
 
 type TopMode = "simple" | "producer";
 
@@ -56,7 +57,7 @@ export default function App() {
           <Flower size={44} petal="#ff9f1c" center="#ffd400" className="shrink-0" />
           <div>
             <h1 className="text-4xl font-bold tracking-tight">
-              dee<span className="text-yellow">synth</span>
+              track<span className="text-yellow">star</span>
             </h1>
             <p className="text-sm text-white/70">
               Hand-gesture synth and AI music producer in one. Simple mode plays;
@@ -72,7 +73,11 @@ export default function App() {
         </div>
 
         {/* Top-level mode toggle */}
-        <div className="mt-4 inline-flex rounded-xl border border-magenta/40 bg-purple/15 p-1">
+        <div
+          className="mt-4 inline-flex rounded-xl border border-magenta/40 bg-purple/15 p-1"
+          role="tablist"
+          aria-label="Trackstar mode"
+        >
           {(
             [
               ["simple", "Simple"],
@@ -81,7 +86,10 @@ export default function App() {
           ).map(([m, label]) => (
             <button
               key={m}
+              type="button"
               onClick={() => setMode(m)}
+              role="tab"
+              aria-selected={mode === m}
               className={`rounded-lg px-5 py-2 text-sm font-semibold transition ${
                 mode === m
                   ? "bg-yellow text-ink"
@@ -96,7 +104,15 @@ export default function App() {
 
       {/* Only one mode is mounted at a time; switching unmounts the other, which
           releases its camera + AudioContext via that component's cleanup. */}
-      {mode === "simple" ? <SimpleMode /> : <ProducerMode />}
+      <Suspense
+        fallback={
+          <div className="rounded-2xl border border-magenta/30 bg-purple/15 p-8 text-center text-white/70" role="status">
+            Loading studio…
+          </div>
+        }
+      >
+        {mode === "simple" ? <SimpleMode /> : <ProducerMode />}
+      </Suspense>
 
       <footer className="mt-8 text-xs text-white/40">
         Best in Chrome/Edge. Camera requires HTTPS or localhost. Hand tracking:
