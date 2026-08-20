@@ -78,6 +78,35 @@ export function effectiveGain(t: TrackMix, anySolo: boolean): number {
   return Math.max(0, Math.min(1, t.volume));
 }
 
+/** Peak absolute sample amplitude in a take (0 for an empty buffer). */
+export function peakAmplitude(samples: Float32Array): number {
+  let peak = 0;
+  for (let i = 0; i < samples.length; i++) {
+    const a = Math.abs(samples[i]);
+    if (a > peak) peak = a;
+  }
+  return peak;
+}
+
+/**
+ * Per-take normalization makeup so a quiet vocal take is audibly present in the
+ * harmony stack (and not buried under the instrument), without amplifying
+ * near-silence into hiss. Returns 1 for an effectively silent take (peak below
+ * `noiseFloor`); otherwise the gain that brings `peak` to `target`, clamped to
+ * [`minGain`, `maxGain`] so no single take is boosted or ducked too hard. Pure
+ * and unit tested. The downstream loop-bus limiter catches the summed peaks.
+ */
+export function normalizeGain(
+  peak: number,
+  target = 0.7,
+  maxGain = 4,
+  noiseFloor = 0.02,
+  minGain = 0.5
+): number {
+  if (!(peak > noiseFloor)) return 1;
+  return Math.max(minGain, Math.min(maxGain, target / peak));
+}
+
 /**
  * Time of the next loop boundary at or after `now`, given the loop's start time
  * and duration. With no established loop (loopStart null) playback can start
@@ -146,6 +175,8 @@ interface LoopTrack {
   muted: boolean;
   solo: boolean;
   volume: number;
+  /** Peak-normalization makeup baked at record time (presence, not user-set). */
+  normGain: number;
   name: string;
   recordSource: RecordSource;
 }
@@ -164,6 +195,13 @@ export class VocalLooper {
   private ctx: AudioContext;
   private output: AudioNode;
   private clickCb: (time: number, accent: boolean) => void;
+
+  // Dedicated loop bus: every take routes here, then through a safety limiter,
+  // so stacked harmonies stay clear and present instead of summing into a
+  // clipped mush. The live instrument does NOT pass through this, so the loop
+  // stack can be balanced without touching the played signal.
+  private loopBus: GainNode;
+  private limiter: DynamicsCompressorNode;
 
   private micStream: MediaStream | null = null;
   private micSource: MediaStreamAudioSourceNode | null = null;
@@ -199,6 +237,18 @@ export class VocalLooper {
     this.ctx = ctx;
     this.output = output;
     this.clickCb = clickCb;
+
+    this.loopBus = ctx.createGain();
+    this.loopBus.gain.value = 1;
+    // Gentle safety limiter so many stacked harmony takes never clip.
+    this.limiter = ctx.createDynamicsCompressor();
+    this.limiter.threshold.value = -6;
+    this.limiter.knee.value = 0;
+    this.limiter.ratio.value = 20;
+    this.limiter.attack.value = 0.003;
+    this.limiter.release.value = 0.15;
+    this.loopBus.connect(this.limiter);
+    this.limiter.connect(this.output);
   }
 
   get isRecording(): boolean {
@@ -441,7 +491,7 @@ export class VocalLooper {
     buffer.getChannelData(0).set(data);
 
     const gain = this.ctx.createGain();
-    gain.connect(this.output);
+    gain.connect(this.loopBus);
 
     const track: LoopTrack = {
       id: this.nextId++,
@@ -451,6 +501,8 @@ export class VocalLooper {
       muted: false,
       solo: false,
       volume: 0.9,
+      // Bring a quiet take up so the harmony is clearly present in the stack.
+      normGain: normalizeGain(peakAmplitude(data)),
       name: `Take ${this.nextId - 1}`,
       recordSource: this.recordSource,
     };
@@ -484,7 +536,11 @@ export class VocalLooper {
     const anySolo = this.tracks.some((t) => t.solo);
     const now = this.ctx.currentTime;
     for (const t of this.tracks) {
-      t.gain.gain.setTargetAtTime(effectiveGain(t, anySolo), now, 0.02);
+      t.gain.gain.setTargetAtTime(
+        effectiveGain(t, anySolo) * t.normGain,
+        now,
+        0.02
+      );
     }
   }
 
@@ -577,6 +633,17 @@ export class VocalLooper {
     const sr = this.ctx.sampleRate;
     const frames = exportLengthSamples(cycles, this.loopDur, sr);
     const oac = new OfflineAudioContext(1, frames, sr);
+    // Mirror the live loop bus + limiter so the bounce matches what is heard.
+    const bus = oac.createGain();
+    bus.gain.value = 1;
+    const lim = oac.createDynamicsCompressor();
+    lim.threshold.value = -6;
+    lim.knee.value = 0;
+    lim.ratio.value = 20;
+    lim.attack.value = 0.003;
+    lim.release.value = 0.15;
+    bus.connect(lim);
+    lim.connect(oac.destination);
     const anySolo = this.tracks.some((t) => t.solo);
     let any = false;
     for (const t of this.tracks) {
@@ -587,9 +654,9 @@ export class VocalLooper {
       s.buffer = t.buffer;
       s.loop = true;
       const gn = oac.createGain();
-      gn.gain.value = g;
+      gn.gain.value = g * t.normGain;
       s.connect(gn);
-      gn.connect(oac.destination);
+      gn.connect(bus);
       s.start(0);
     }
     if (!any) return null;
@@ -602,6 +669,16 @@ export class VocalLooper {
     this.recording = false;
     this.teardownCapture();
     this.clearAll();
+    try {
+      this.loopBus.disconnect();
+    } catch {
+      /* ignore */
+    }
+    try {
+      this.limiter.disconnect();
+    } catch {
+      /* ignore */
+    }
     if (this.micSource) {
       try {
         this.micSource.disconnect();

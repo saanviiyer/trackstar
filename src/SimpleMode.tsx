@@ -39,7 +39,7 @@ import {
   type DrumPatternName,
 } from "./lib/drums";
 import { LandmarkSmoother } from "./lib/smoothing";
-import { Vocoder, opennessToWet } from "./lib/vocoder";
+import { Vocoder } from "./lib/vocoder";
 import {
   VocalLooper,
   type RecordSource,
@@ -518,13 +518,16 @@ export default function SimpleMode() {
         }
 
         // Hand-controlled vocoder: the LEFT (modifier) hand's openness drives
-        // the wet amount live (open = full vocoder, closed / no left hand = dry).
-        // This uses the left hand only, so it never conflicts with the right
-        // hand's finger-count chord selection. setMix ramps, so it is click-free.
+        // the wet amount live (open = full vocoder, closed = relaxed/dry). This
+        // uses the left hand only, so it never conflicts with the right hand's
+        // finger-count chord selection. updateHandWet holds the last value
+        // through brief tracking dropouts, keeps a wet floor so it never fully
+        // cuts out, and ramps slowly so hand flicker does not stutter the sound.
         const voc = vocoderRef.current;
         if (voc && c.vocoderOn && c.handVocoder) {
-          const openness = modHand ? modHand.openness : 0;
-          voc.setMix(opennessToWet(openness), (v) => synth.setDryGain(v));
+          voc.updateHandWet(modHand ? modHand.openness : null, (v) =>
+            synth.setDryGain(v)
+          );
         }
 
         setSelection(sel);

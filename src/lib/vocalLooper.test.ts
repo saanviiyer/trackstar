@@ -8,6 +8,8 @@ import {
   exportLengthSamples,
   sourcesForSelection,
   encodeWavBytes,
+  peakAmplitude,
+  normalizeGain,
 } from "./vocalLooper";
 
 describe("loop length from BPM + bars", () => {
@@ -61,6 +63,36 @@ describe("overdub / track gain mix", () => {
     const sum = tracks.reduce((a, t) => a + effectiveGain(t, anySolo), 0);
     // Only the soloed track contributes.
     expect(sum).toBeCloseTo(0.5, 6);
+  });
+});
+
+describe("harmony-take normalization (presence in the stack)", () => {
+  it("peakAmplitude finds the largest absolute sample", () => {
+    expect(peakAmplitude(new Float32Array([0, 0.3, -0.8, 0.5]))).toBeCloseTo(0.8, 6);
+    expect(peakAmplitude(new Float32Array([]))).toBe(0);
+    expect(peakAmplitude(new Float32Array([0, 0, 0]))).toBe(0);
+  });
+
+  it("boosts a quiet take up toward the target level", () => {
+    // A quiet take peaking at 0.1 gets brought up (target 0.7 -> gain 7, capped).
+    const g = normalizeGain(0.1);
+    expect(g).toBeGreaterThan(1);
+    expect(0.1 * g).toBeLessThanOrEqual(0.7 + 1e-6);
+  });
+
+  it("does not amplify near-silence into hiss", () => {
+    expect(normalizeGain(0)).toBe(1);
+    expect(normalizeGain(0.01)).toBe(1); // below the noise floor
+  });
+
+  it("clamps the makeup so no take is boosted or ducked too hard", () => {
+    expect(normalizeGain(0.0001, 0.7, 4, 0)).toBe(4); // huge boost capped at maxGain
+    expect(normalizeGain(1.0)).toBeGreaterThanOrEqual(0.5); // hot take not over-ducked
+    expect(normalizeGain(1.0)).toBeLessThanOrEqual(1);
+  });
+
+  it("a take already near the target is left roughly as-is", () => {
+    expect(normalizeGain(0.7)).toBeCloseTo(1, 6);
   });
 });
 
