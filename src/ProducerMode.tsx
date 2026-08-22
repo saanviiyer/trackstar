@@ -18,7 +18,9 @@ import { Arpeggiator } from "./lib/arp";
 import { DrumMachine, DRUM_PATTERN_NAMES, type DrumPatternName } from "./lib/drums";
 import { LandmarkSmoother } from "./lib/smoothing";
 import { drawHand } from "./lib/draw";
-import { ProducerMixer, type MixerTrackState } from "./lib/producerMixer";
+import { ProducerMixer, type MixerTrackState, type TransportInfo } from "./lib/producerMixer";
+import Timeline from "./Timeline";
+import { barBeatFromPosition } from "./lib/transport";
 import {
   cleanProjectName,
   clearAutosave,
@@ -117,12 +119,24 @@ export default function ProducerMode() {
   const [recording, setRecording] = useState<boolean>(false);
   const [playing, setPlaying] = useState<boolean>(false);
   const [loopBars, setLoopBars] = useState<number>(2);
-  const [countIn, setCountIn] = useState<boolean>(true);
+  const [countInBars, setCountInBars] = useState<number>(1);
+  const [beatsPerBar, setBeatsPerBar] = useState<number>(4);
+  const [metronome, setMetronome] = useState<boolean>(false);
   const [recordSource, setRecordSource] = useState<"instrument" | "mic">(
     "instrument"
   );
   const [exportCycles, setExportCycles] = useState<number>(2);
   const [mixerError, setMixerError] = useState<string>("");
+  const [transport, setTransport] = useState<TransportInfo>({
+    playing: false,
+    recording: false,
+    countingIn: false,
+    countInRemaining: 0,
+    positionSec: 0,
+    loopDurationSec: 0,
+    cycle: 0,
+  });
+  const lastTransportRef = useRef<number>(0);
 
   // deejai AI
   const [backendUp, setBackendUp] = useState<boolean | null>(null); // null=checking
@@ -236,8 +250,11 @@ export default function ProducerMode() {
   }, [drumsOn, drumPattern, arpBpm]);
 
   useEffect(() => {
-    mixerRef.current?.setConfig({ bpm: arpBpm, bars: loopBars, free: false });
-  }, [arpBpm, loopBars]);
+    const m = mixerRef.current;
+    if (!m) return;
+    m.setConfig({ bpm: arpBpm, bars: loopBars, free: false, beatsPerBar });
+    m.setMetronome(metronome);
+  }, [arpBpm, loopBars, beatsPerBar, metronome]);
   useEffect(() => {
     mixerRef.current?.setRecordSource(recordSource);
   }, [recordSource]);
@@ -336,6 +353,13 @@ export default function ProducerMode() {
         setSelection(sel);
       }
     }
+    // Poll the transport ~20fps for a smooth playhead + count-in readout.
+    const nowMs = performance.now();
+    const mx = mixerRef.current;
+    if (mx && nowMs - lastTransportRef.current > 50) {
+      lastTransportRef.current = nowMs;
+      setTransport(mx.getTransportInfo());
+    }
     rafRef.current = requestAnimationFrame(loop);
   }, []);
 
@@ -378,8 +402,9 @@ export default function ProducerMode() {
         );
         const instr = s.getInstrumentBus();
         if (instr) mixer.setInstrumentNode(instr);
-        mixer.setConfig({ bpm: arpBpm, bars: loopBars, free: false });
+        mixer.setConfig({ bpm: arpBpm, bars: loopBars, free: false, beatsPerBar });
         mixer.setRecordSource(recordSource);
+        mixer.setMetronome(metronome);
         mixer.onChange = () => {
           const m = mixerRef.current;
           if (!m) return;
@@ -420,7 +445,7 @@ export default function ProducerMode() {
       setPhase("error");
       setErrorMsg(err instanceof Error ? err.message : String(err));
     }
-  }, [loop, volume, presetName, arpBpm, drumPattern, drumsOn, loopBars, recordSource, restoreProjectIfReady]);
+  }, [loop, volume, presetName, arpBpm, drumPattern, drumsOn, loopBars, recordSource, beatsPerBar, metronome, restoreProjectIfReady]);
 
   useEffect(() => {
     if (!projectLoaded || !restoreCompleteRef.current || !mixerRef.current) return;
@@ -466,6 +491,8 @@ export default function ProducerMode() {
       setMixerError("Enable camera & sound first.");
       return;
     }
+    // Resume the shared AudioContext on this user gesture.
+    await synthRef.current.ensureStarted();
     if (m.isRecording) {
       m.stopRecording();
       return;
@@ -482,14 +509,29 @@ export default function ProducerMode() {
         return;
       }
     }
-    m.setConfig({ bpm: arpBpm, bars: loopBars, free: false });
+    m.setConfig({ bpm: arpBpm, bars: loopBars, free: false, beatsPerBar });
     m.setRecordSource(recordSource);
     if (!m.canRecord()) {
       setMixerError("Selected source is not available.");
       return;
     }
-    m.arm(countIn ? 1 : 0);
-  }, [recordSource, arpBpm, loopBars, countIn, getSharedMic]);
+    // Cycle recording: count-in, then every pass around the loop lands a new
+    // phase-locked take, so the singer keeps stacking harmonies until Stop.
+    m.armCycle(countInBars);
+  }, [recordSource, arpBpm, loopBars, beatsPerBar, countInBars, getSharedMic]);
+
+  const togglePlay = useCallback(async () => {
+    const m = mixerRef.current;
+    if (!m) return;
+    await synthRef.current.ensureStarted();
+    if (m.isPlaying) m.stopAll();
+    else m.playAll();
+  }, []);
+
+  const getPeaks = useCallback(
+    (id: number, buckets: number) => mixerRef.current?.getPeaks(id, buckets) ?? null,
+    []
+  );
 
   const exportMix = useCallback(async () => {
     const m = mixerRef.current;
@@ -733,6 +775,167 @@ export default function ProducerMode() {
           </div>
         </div>
 
+        {/* TRANSPORT */}
+        <div className="mt-4 rounded-2xl border border-magenta/30 bg-purple/15 p-4">
+          <div className="mb-3 flex flex-wrap items-center gap-2">
+            <button
+              onClick={togglePlay}
+              disabled={tracks.length === 0}
+              className={`rounded-lg px-4 py-2 text-sm font-semibold transition ${
+                tracks.length === 0
+                  ? "cursor-not-allowed bg-purple/25 text-white/40"
+                  : "bg-yellow text-ink hover:bg-orange"
+              }`}
+              aria-label={playing ? "Stop" : "Play"}
+            >
+              {playing ? "Stop" : "Play"}
+            </button>
+            <button
+              onClick={toggleRecord}
+              disabled={!started}
+              className={`rounded-lg px-4 py-2 text-sm font-semibold transition ${
+                !started
+                  ? "cursor-not-allowed bg-purple/25 text-white/40"
+                  : recording
+                    ? "animate-pulse bg-orange text-ink hover:bg-yellow"
+                    : "bg-magenta text-ink hover:bg-magenta/80"
+              }`}
+            >
+              {recording ? "Stop recording" : "Record"}
+            </button>
+
+            {/* Live transport readout */}
+            <div className="ml-1 flex items-center gap-3 font-mono text-sm">
+              {transport.countingIn ? (
+                <span className="rounded bg-orange px-2 py-1 font-bold text-ink">
+                  Count-in {Math.max(1, Math.ceil(transport.countInRemaining / (60 / arpBpm)))}
+                </span>
+              ) : recording ? (
+                <span className="flex items-center gap-1 text-orange">
+                  <span className="inline-block h-2.5 w-2.5 rounded-full bg-orange" />
+                  REC · take {transport.cycle + 1}
+                </span>
+              ) : (
+                <span className="text-white/50">{playing ? "Playing" : "Stopped"}</span>
+              )}
+              {(() => {
+                const bb = barBeatFromPosition(
+                  transport.positionSec,
+                  arpBpm,
+                  beatsPerBar,
+                  loopBars
+                );
+                return (
+                  <span className="text-white/70">
+                    {bb.bar}.{bb.beat}
+                  </span>
+                );
+              })()}
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
+            <label className="flex items-center gap-1.5 text-white/70">
+              Tempo
+              <input
+                type="number"
+                min={60}
+                max={200}
+                value={arpBpm}
+                onChange={(e) =>
+                  setArpBpm(Math.max(60, Math.min(200, Number(e.target.value) || 120)))
+                }
+                className="w-16 rounded-lg border border-purple/50 bg-purple/25 px-2 py-1"
+              />
+              <span className="text-white/45">BPM</span>
+            </label>
+            <label className="flex items-center gap-1.5 text-white/70">
+              Time
+              <select
+                value={beatsPerBar}
+                onChange={(e) => setBeatsPerBar(Number(e.target.value))}
+                className="rounded-lg border border-purple/50 bg-purple/25 px-2 py-1"
+              >
+                {[2, 3, 4, 5].map((n) => (
+                  <option key={n} value={n}>
+                    {n}/4
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flex items-center gap-1.5 text-white/70">
+              Loop
+              <select
+                value={loopBars}
+                onChange={(e) => setLoopBars(Number(e.target.value))}
+                className="rounded-lg border border-purple/50 bg-purple/25 px-2 py-1"
+              >
+                {[1, 2, 4, 8].map((b) => (
+                  <option key={b} value={b}>
+                    {b} {b === 1 ? "bar" : "bars"}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flex items-center gap-1.5 text-white/70">
+              Count-in
+              <select
+                value={countInBars}
+                onChange={(e) => setCountInBars(Number(e.target.value))}
+                className="rounded-lg border border-purple/50 bg-purple/25 px-2 py-1"
+              >
+                <option value={0}>Off</option>
+                <option value={1}>1 bar</option>
+                <option value={2}>2 bars</option>
+              </select>
+            </label>
+            <label className="flex items-center gap-1.5">
+              <input
+                type="checkbox"
+                checked={metronome}
+                onChange={(e) => setMetronome(e.target.checked)}
+              />
+              Metronome
+            </label>
+            <label className="flex items-center gap-1.5 text-white/70">
+              Record
+              <select
+                value={recordSource}
+                onChange={(e) => setRecordSource(e.target.value as "instrument" | "mic")}
+                className="rounded-lg border border-purple/50 bg-purple/25 px-2 py-1"
+              >
+                <option value="instrument">Instrument</option>
+                <option value="mic">Mic (voice)</option>
+              </select>
+            </label>
+          </div>
+          <p className="mt-2 text-xs text-white/55">
+            Stack vocals: pick Mic, press Record. After the count-in, every pass
+            around the loop drops a new harmony take that loops in sync. Keep
+            singing to layer more, then press Stop recording. Use headphones so
+            the metronome and existing layers are not picked up by the mic.
+          </p>
+        </div>
+
+        {/* TIMELINE */}
+        <div className="mt-4">
+          <Timeline
+            tracks={tracks}
+            bpm={arpBpm}
+            beatsPerBar={beatsPerBar}
+            loopBars={loopBars}
+            loopDurSec={transport.loopDurationSec}
+            playheadSec={transport.positionSec}
+            playing={playing}
+            getPeaks={getPeaks}
+            onSetBars={setLoopBars}
+            onMove={(id, off) => mixerRef.current?.setTrackOffset(id, off)}
+            onTrim={(id, s, e) => mixerRef.current?.trimTrack(id, s, e)}
+            onDuplicate={(id) => mixerRef.current?.duplicateTrack(id)}
+            onDelete={(id) => mixerRef.current?.deleteTrack(id)}
+          />
+        </div>
+
         {/* MIXER */}
         <div className="mt-4 rounded-2xl border border-magenta/30 bg-purple/15 p-4">
           <div className="mb-4 flex flex-wrap items-end gap-2 border-b border-magenta/20 pb-3">
@@ -765,19 +968,6 @@ export default function ProducerMode() {
             </h2>
             <div className="flex items-center gap-2">
               <button
-                onClick={() =>
-                  playing ? mixerRef.current?.stopAll() : mixerRef.current?.playAll()
-                }
-                disabled={tracks.length === 0}
-                className={`rounded-lg px-3 py-1.5 text-sm font-medium transition ${
-                  tracks.length === 0
-                    ? "cursor-not-allowed bg-purple/25 text-white/40"
-                    : "bg-purple/45 text-white hover:bg-magenta/40"
-                }`}
-              >
-                {playing ? "Stop all" : "Play all"}
-              </button>
-              <button
                 onClick={() => {
                   if (window.confirm("Clear all mixer tracks? This cannot be undone.")) {
                     mixerRef.current?.clearAll();
@@ -795,48 +985,8 @@ export default function ProducerMode() {
             </div>
           </div>
 
-          {/* Record controls */}
+          {/* Import (record/transport now live in the transport bar above) */}
           <div className="mb-3 flex flex-wrap items-center gap-2 text-sm">
-            <button
-              onClick={toggleRecord}
-              disabled={!started}
-              className={`rounded-lg px-3 py-1.5 font-medium transition ${
-                !started
-                  ? "cursor-not-allowed bg-purple/25 text-white/40"
-                  : recording
-                    ? "bg-orange text-ink hover:bg-yellow"
-                    : "bg-magenta text-ink hover:bg-magenta/80"
-              }`}
-            >
-              {recording ? "Stop take" : "Record loop"}
-            </button>
-            <select
-              value={recordSource}
-              onChange={(e) => setRecordSource(e.target.value as "instrument" | "mic")}
-              className="rounded-lg border border-purple/50 bg-purple/25 px-2 py-1"
-            >
-              <option value="instrument">Instrument</option>
-              <option value="mic">Mic</option>
-            </select>
-            <select
-              value={loopBars}
-              onChange={(e) => setLoopBars(Number(e.target.value))}
-              className="rounded-lg border border-purple/50 bg-purple/25 px-2 py-1"
-            >
-              {[1, 2, 4, 8].map((b) => (
-                <option key={b} value={b}>
-                  {b} {b === 1 ? "bar" : "bars"}
-                </option>
-              ))}
-            </select>
-            <label className="flex items-center gap-1.5">
-              <input
-                type="checkbox"
-                checked={countIn}
-                onChange={(e) => setCountIn(e.target.checked)}
-              />
-              Count-in
-            </label>
             <label
               className={`cursor-pointer rounded-lg px-3 py-1.5 font-medium transition ${
                 importingAudio
@@ -911,6 +1061,19 @@ export default function ProducerMode() {
                         } ${anySolo && !t.solo ? "opacity-60" : ""}`}
                       >
                         S
+                      </button>
+                      <button
+                        onClick={() => mixerRef.current?.setArm(t.id, !t.armed)}
+                        aria-label={`${t.armed ? "Disarm" : "Arm"} ${t.name} for punch-in record`}
+                        aria-pressed={t.armed}
+                        title="Arm for punch-in record (replaces this track on the next cycle)"
+                        className={`rounded px-2 py-0.5 text-xs font-medium ${
+                          t.armed
+                            ? "bg-orange text-ink"
+                            : "bg-purple/25 text-white/80 hover:bg-magenta/40"
+                        }`}
+                      >
+                        R
                       </button>
                       <button
                         aria-label={`Download ${t.name} as WAV`}
