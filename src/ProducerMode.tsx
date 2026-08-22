@@ -462,7 +462,7 @@ export default function ProducerMode() {
         mixer: mixer.createSnapshot(),
       })
         .then(() => setSaveStatus("Saved locally"))
-        .catch(() => setSaveStatus("Autosave failed — export important tracks"));
+        .catch(() => setSaveStatus("Autosave failed, export important tracks"));
     }, 700);
     return () => window.clearTimeout(timer);
   }, [tracks, projectName, arpBpm, loopBars, projectLoaded]);

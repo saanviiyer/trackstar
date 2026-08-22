@@ -314,7 +314,7 @@ export default function Timeline({
                     className="absolute top-1 overflow-hidden rounded ring-1 ring-white/10"
                     style={{ left: x, width: w, height: LANE_H - 8, background: clipColor }}
                     onPointerDown={(e) => onClipPointerDown(e, t, "move")}
-                    title={`${t.name} — drag to move`}
+                    title={`${t.name}, drag to move`}
                   >
                     <div className="pointer-events-none absolute left-1 top-0.5 z-10 max-w-full truncate pr-1 text-[10px] font-medium text-ink">
                       {t.name}
