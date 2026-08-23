@@ -224,8 +224,10 @@ export class ProducerMixer {
   // click is NEVER captured into an instrument take.
   private clickGain: GainNode;
 
-  private micSource: MediaStreamAudioSourceNode | null = null;
-  private micStream: MediaStream | null = null;
+  // Shared mic tap (the Synth's mic hub). The mixer never creates its own
+  // MediaStreamAudioSourceNode: only one source node may exist per mic stream or
+  // the recorder captures silence. See Synth.getMicNode().
+  private micSource: AudioNode | null = null;
   private instrumentNode: AudioNode | null = null;
 
   // capture state (recording a live instrument/mic loop)
@@ -335,10 +337,13 @@ export class ProducerMixer {
   setRecordSource(sel: RecordSource): void {
     this.recordSource = sel;
   }
-  setMicStream(stream: MediaStream): void {
-    if (this.micStream === stream && this.micSource) return;
-    this.micStream = stream;
-    this.micSource = this.ctx.createMediaStreamSource(stream);
+  /**
+   * Provide the shared mic tap node (the Synth's mic hub, the SAME node the
+   * vocoder and level meter read). The mixer does NOT create its own
+   * MediaStreamAudioSourceNode, so cycle takes always contain the user's voice.
+   */
+  setMicNode(node: AudioNode): void {
+    this.micSource = node;
   }
   setInstrumentNode(node: AudioNode): void {
     this.instrumentNode = node;
@@ -1276,13 +1281,8 @@ export class ProducerMixer {
     } catch {
       /* ignore */
     }
-    if (this.micSource) {
-      try {
-        this.micSource.disconnect();
-      } catch {
-        /* ignore */
-      }
-      this.micSource = null;
-    }
+    // The mic node is shared and owned by the Synth; just drop the reference.
+    // Any capture edges were already removed in teardownCapture().
+    this.micSource = null;
   }
 }

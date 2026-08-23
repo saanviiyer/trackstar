@@ -42,9 +42,12 @@ import { LandmarkSmoother } from "./lib/smoothing";
 import { Vocoder } from "./lib/vocoder";
 import {
   VocalLooper,
+  sourcesForSelection,
   type RecordSource,
   type LoopTrackState,
 } from "./lib/vocalLooper";
+import { InputMeter } from "./lib/meter";
+import { InputLevelMeter } from "./InputLevelMeter";
 import { drawHand } from "./lib/draw";
 import { Legend } from "./Legend";
 
@@ -202,6 +205,8 @@ export default function SimpleMode() {
   const recordTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const recordStartRef = useRef<number>(0);
   const looperRef = useRef<VocalLooper | null>(null);
+  const inputMeterRef = useRef<InputMeter | null>(null);
+  const [micReady, setMicReady] = useState<boolean>(false);
 
   const [phase, setPhase] = useState<Phase>("idle");
   const [status, setStatus] = useState<string>("");
@@ -584,6 +589,7 @@ export default function SimpleMode() {
         if (instr) looperRef.current.setInstrumentNode(instr);
         looperRef.current.setConfig({ bpm: arpBpm, bars: loopBars, free: loopFree });
         looperRef.current.setRecordSource(loopSource);
+        if (!inputMeterRef.current) inputMeterRef.current = new InputMeter(audioCtx);
         looperRef.current.onChange = () => {
           const lp = looperRef.current;
           if (!lp) return;
@@ -648,14 +654,62 @@ export default function SimpleMode() {
     loopSource,
   ]);
 
-  // Acquire the microphone once and share it between the vocoder and looper so
-  // we never open two conflicting getUserMedia streams.
+  // Acquire the microphone once and route it into the synth's single shared mic
+  // hub, so the vocoder, looper and level meter all read ONE source node (only
+  // one MediaStreamAudioSourceNode may exist per stream, or the recorder gets
+  // silence).
   const getSharedMic = useCallback(async (): Promise<MediaStream> => {
     if (micStreamRef.current) return micStreamRef.current;
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     micStreamRef.current = stream;
+    synthRef.current.setMicStream(stream);
+    setMicReady(true);
     return stream;
   }, []);
+
+  // Point the input meter at the node(s) the current source records from, so the
+  // bar reflects exactly what a take would capture.
+  const updateMeterInputs = useCallback((sel: RecordSource) => {
+    const meter = inputMeterRef.current;
+    if (!meter) return;
+    const s = synthRef.current;
+    const nodes: AudioNode[] = [];
+    for (const kind of sourcesForSelection(sel)) {
+      const node = kind === "mic" ? s.getMicNode() : s.getInstrumentBus();
+      if (node) nodes.push(node);
+    }
+    meter.setInputs(nodes);
+  }, []);
+
+  // Choose the record source. For a source that needs the mic, request it up
+  // front so the meter is live before recording; the shared hub means this never
+  // conflicts with the vocoder.
+  const selectLoopSource = useCallback(
+    async (sel: RecordSource) => {
+      setLoopSource(sel);
+      setLoopError("");
+      if ((sel === "mic" || sel === "mix") && !micStreamRef.current) {
+        try {
+          await getSharedMic();
+        } catch (err) {
+          setLoopError(
+            err instanceof Error
+              ? `Microphone unavailable: ${err.message}`
+              : "Microphone permission denied."
+          );
+        }
+      }
+      updateMeterInputs(sel);
+    },
+    [getSharedMic, updateMeterInputs]
+  );
+
+  // Keep the meter pointed at the right source as selection / mic availability
+  // change (e.g. after the app starts or the mic is granted).
+  useEffect(() => {
+    if (phase !== "running") return;
+    updateMeterInputs(loopSource);
+  }, [phase, loopSource, micReady, updateMeterInputs]);
 
   // Toggle the vocoder: request mic on enable, crossfade the wet/dry path.
   const toggleVocoder = useCallback(
@@ -684,9 +738,8 @@ export default function SimpleMode() {
         return;
       }
 
-      let stream: MediaStream;
       try {
-        stream = await getSharedMic();
+        await getSharedMic();
       } catch (err) {
         setVocoderOn(false);
         setMicError(
@@ -694,6 +747,12 @@ export default function SimpleMode() {
             ? `Microphone unavailable: ${err.message}`
             : "Microphone permission denied."
         );
+        return;
+      }
+      const micNode = synth.getMicNode();
+      if (!micNode) {
+        setVocoderOn(false);
+        setMicError("Microphone unavailable.");
         return;
       }
 
@@ -705,7 +764,9 @@ export default function SimpleMode() {
         bands: 24,
         strength: vocoderStrength,
       });
-      voc.setModulatorStream(stream);
+      // Read the SHARED mic hub, not a fresh source node, so the looper keeps
+      // receiving the voice while the vocoder is on.
+      voc.setModulatorNode(micNode);
       voc.setMicGain(micGain);
       // Hand mode starts dry (open your hand to bring it in); manual mode uses
       // the wet/dry slider value.
@@ -822,11 +883,11 @@ export default function SimpleMode() {
       lp.stopRecording();
       return;
     }
-    // Ensure the mic for any source that needs it.
+    // Ensure the mic for any source that needs it, then hand the looper the
+    // SHARED mic hub node (not a fresh source node).
     if (loopSource === "mic" || loopSource === "mix") {
       try {
-        const stream = await getSharedMic();
-        lp.setMicStream(stream);
+        await getSharedMic();
       } catch (err) {
         setLoopError(
           err instanceof Error
@@ -835,6 +896,8 @@ export default function SimpleMode() {
         );
         return;
       }
+      const micNode = synthRef.current.getMicNode();
+      if (micNode) lp.setMicNode(micNode);
     }
     lp.setConfig({ bpm: arpBpm, bars: loopBars, free: loopFree });
     lp.setRecordSource(loopSource);
@@ -842,8 +905,9 @@ export default function SimpleMode() {
       setLoopError("Selected source is not available.");
       return;
     }
+    updateMeterInputs(loopSource);
     lp.arm(loopCountIn ? 1 : 0);
-  }, [loopSource, arpBpm, loopBars, loopFree, loopCountIn, getSharedMic]);
+  }, [loopSource, arpBpm, loopBars, loopFree, loopCountIn, getSharedMic, updateMeterInputs]);
 
   const downloadTake = useCallback((id: number) => {
     const lp = looperRef.current;
@@ -872,6 +936,8 @@ export default function SimpleMode() {
       arpRef.current?.stop();
       drumsRef.current?.stop();
       looperRef.current?.dispose();
+      inputMeterRef.current?.dispose();
+      inputMeterRef.current = null;
       if (recordTimerRef.current) clearInterval(recordTimerRef.current);
       if (recorderRef.current && recorderRef.current.state !== "inactive") {
         try {
@@ -1969,7 +2035,7 @@ export default function SimpleMode() {
                     ).map(([s, label]) => (
                       <button
                         key={s}
-                        onClick={() => setLoopSource(s)}
+                        onClick={() => selectLoopSource(s)}
                         className={`rounded-md px-2 py-1 text-xs font-medium transition ${
                           loopSource === s
                             ? "bg-yellow text-ink"
@@ -1981,6 +2047,24 @@ export default function SimpleMode() {
                     ))}
                   </div>
                 </div>
+
+                {/* Live input level meter for the selected source */}
+                <InputLevelMeter
+                  meter={inputMeterRef}
+                  active={started}
+                  label={
+                    loopSource === "mic"
+                      ? "Mic"
+                      : loopSource === "mix"
+                        ? "Mix"
+                        : "Instrument"
+                  }
+                  unavailable={
+                    (loopSource === "mic" || loopSource === "mix") && !micReady
+                      ? "Microphone not available yet. Pick Mic or Mix to allow it, or check your browser permission."
+                      : null
+                  }
+                />
 
                 {/* Loop length */}
                 <div className="mb-3 text-sm">
