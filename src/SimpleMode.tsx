@@ -39,7 +39,7 @@ import {
   type DrumPatternName,
 } from "./lib/drums";
 import { LandmarkSmoother } from "./lib/smoothing";
-import { Vocoder } from "./lib/vocoder";
+import { Harmonizer } from "./lib/harmonizer";
 import {
   VocalLooper,
   sourcesForSelection,
@@ -164,6 +164,13 @@ function Flower({
   );
 }
 
+/** Nearest note name (e.g. "C4") for a frequency in Hz. */
+function freqToNoteLabel(hz: number): string {
+  if (!hz || hz <= 0) return "-";
+  const midi = Math.round(12 * Math.log2(hz / 440) + 69);
+  return midiToName(midi);
+}
+
 type Phase =
   | "idle"
   | "loading-model"
@@ -183,7 +190,10 @@ export default function SimpleMode() {
   const synthRef = useRef<Synth>(new Synth());
   const arpRef = useRef<Arpeggiator | null>(null);
   const drumsRef = useRef<DrumMachine | null>(null);
-  const vocoderRef = useRef<Vocoder | null>(null);
+  const harmonizerRef = useRef<Harmonizer | null>(null);
+  // Frequencies of the chord the user is currently holding, updated each frame
+  // so the harmonizer can lock its voices onto the held chord's tones.
+  const heldChordFreqsRef = useRef<number[]>([]);
   const micStreamRef = useRef<MediaStream | null>(null);
   const rafRef = useRef<number | null>(null);
   const lastVideoTimeRef = useRef<number>(-1);
@@ -252,13 +262,14 @@ export default function SimpleMode() {
   const [recordElapsed, setRecordElapsed] = useState<number>(0);
   const [recordError, setRecordError] = useState<string>("");
 
-  // Vocoder controls
-  const [vocoderOn, setVocoderOn] = useState<boolean>(false);
-  const [micGain, setMicGain] = useState<number>(1);
+  // Harmonizer controls
+  const [harmonizerOn, setHarmonizerOn] = useState<boolean>(false);
   const [micError, setMicError] = useState<string>("");
-  const [handVocoder, setHandVocoder] = useState<boolean>(false);
-  const [vocoderWet, setVocoderWet] = useState<number>(1);
-  const [vocoderStrength, setVocoderStrength] = useState<number>(1);
+  const [harmonizerLevel, setHarmonizerLevel] = useState<number>(0.9);
+  const [harmonizerDryWet, setHarmonizerDryWet] = useState<number>(0.7);
+  const [harmonizerVoices, setHarmonizerVoices] = useState<number>(4);
+  // Live readout of the detected sung pitch (Hz), for on-screen feedback.
+  const [sungPitch, setSungPitch] = useState<number | null>(null);
 
   // Vocal looper
   const [loopSource, setLoopSource] = useState<RecordSource>("mic");
@@ -291,8 +302,6 @@ export default function SimpleMode() {
     twoHand,
     arpOn,
     latchOn,
-    handVocoder,
-    vocoderOn,
     progression: progressionSlots.map((s) => s.chord),
   });
   useEffect(() => {
@@ -305,8 +314,6 @@ export default function SimpleMode() {
       twoHand,
       arpOn,
       latchOn,
-      handVocoder,
-      vocoderOn,
       progression: progressionSlots.map((s) => s.chord),
     };
   }, [
@@ -318,8 +325,6 @@ export default function SimpleMode() {
     twoHand,
     arpOn,
     latchOn,
-    handVocoder,
-    vocoderOn,
     progressionSlots,
   ]);
 
@@ -404,20 +409,16 @@ export default function SimpleMode() {
     arpBpm,
   ]);
 
+  // Keep the harmonizer's live parameters in sync with the UI controls.
   useEffect(() => {
-    vocoderRef.current?.setMicGain(micGain);
-  }, [micGain]);
+    harmonizerRef.current?.setOutputLevel(harmonizerLevel);
+  }, [harmonizerLevel]);
   useEffect(() => {
-    vocoderRef.current?.setStrength(vocoderStrength);
-  }, [vocoderStrength]);
-  // Manual wet/dry slider drives the mix only when hand control is off.
+    harmonizerRef.current?.setDryWet(harmonizerDryWet);
+  }, [harmonizerDryWet]);
   useEffect(() => {
-    if (!handVocoder) {
-      vocoderRef.current?.setMix(vocoderWet, (v) =>
-        synthRef.current.setDryGain(v)
-      );
-    }
-  }, [vocoderWet, handVocoder]);
+    harmonizerRef.current?.setMaxVoices(harmonizerVoices);
+  }, [harmonizerVoices]);
 
   // Keep the looper config synced (shares the transport BPM with arp/drums).
   useEffect(() => {
@@ -522,17 +523,16 @@ export default function SimpleMode() {
           synth.playFreqs(freqs);
         }
 
-        // Hand-controlled vocoder: the LEFT (modifier) hand's openness drives
-        // the wet amount live (open = full vocoder, closed = relaxed/dry). This
-        // uses the left hand only, so it never conflicts with the right hand's
-        // finger-count chord selection. updateHandWet holds the last value
-        // through brief tracking dropouts, keeps a wet floor so it never fully
-        // cuts out, and ramps slowly so hand flicker does not stutter the sound.
-        const voc = vocoderRef.current;
-        if (voc && c.vocoderOn && c.handVocoder) {
-          voc.updateHandWet(modHand ? modHand.openness : null, (v) =>
-            synth.setDryGain(v)
-          );
+        // Vocal harmonizer: the tones of the chord the user is holding are the
+        // harmony targets. Feed them to the harmonizer each frame; it detects
+        // the sung pitch on the mic and re-locks a pitch-shifted copy of the
+        // voice onto each chord tone. It no-ops cheaply while disabled. When
+        // resting (no chord), the empty list fades the harmonies out.
+        heldChordFreqsRef.current = freqs;
+        const harm = harmonizerRef.current;
+        if (harm) {
+          harm.update(freqs);
+          setSungPitch(harm.getDetectedPitch());
         }
 
         setSelection(sel);
@@ -655,7 +655,7 @@ export default function SimpleMode() {
   ]);
 
   // Acquire the microphone once and route it into the synth's single shared mic
-  // hub, so the vocoder, looper and level meter all read ONE source node (only
+  // hub, so the harmonizer, looper and level meter all read ONE source node (only
   // one MediaStreamAudioSourceNode may exist per stream, or the recorder gets
   // silence).
   const getSharedMic = useCallback(async (): Promise<MediaStream> => {
@@ -683,7 +683,7 @@ export default function SimpleMode() {
 
   // Choose the record source. For a source that needs the mic, request it up
   // front so the meter is live before recording; the shared hub means this never
-  // conflicts with the vocoder.
+  // conflicts with the harmonizer.
   const selectLoopSource = useCallback(
     async (sel: RecordSource) => {
       setLoopSource(sel);
@@ -711,29 +711,29 @@ export default function SimpleMode() {
     updateMeterInputs(loopSource);
   }, [phase, loopSource, micReady, updateMeterInputs]);
 
-  // Toggle the vocoder: request mic on enable, crossfade the wet/dry path.
-  const toggleVocoder = useCallback(
+  // Toggle the harmonizer: request the mic on enable, build the graph, and feed
+  // its output into the instrument bus so takes and loops capture the harmony.
+  const toggleHarmonizer = useCallback(
     async (enable: boolean) => {
       setMicError("");
       const synth = synthRef.current;
       const audioCtx = synth.getContext();
-      const carrier = synth.getCarrierNode();
 
       if (!enable) {
-        setVocoderOn(false);
-        const v = vocoderRef.current;
-        if (v && audioCtx) {
-          v.stop((val) => synth.setDryGain(val));
+        setHarmonizerOn(false);
+        const h = harmonizerRef.current;
+        if (h) {
+          h.stop();
           setTimeout(() => {
-            v.dispose();
-            vocoderRef.current = null;
+            h.dispose();
+            harmonizerRef.current = null;
             // Leave the shared mic open; the looper may still be using it.
           }, 200);
         }
         return;
       }
 
-      if (!audioCtx || !carrier) {
+      if (!audioCtx) {
         setMicError("Start the app (Enable camera & sound) first.");
         return;
       }
@@ -741,7 +741,7 @@ export default function SimpleMode() {
       try {
         await getSharedMic();
       } catch (err) {
-        setVocoderOn(false);
+        setHarmonizerOn(false);
         setMicError(
           err instanceof Error
             ? `Microphone unavailable: ${err.message}`
@@ -751,36 +751,31 @@ export default function SimpleMode() {
       }
       const micNode = synth.getMicNode();
       if (!micNode) {
-        setVocoderOn(false);
+        setHarmonizerOn(false);
         setMicError("Microphone unavailable.");
         return;
       }
 
-      // Route the vocoder into the instrument bus so it is part of the played
+      // Route the harmonizer into the instrument bus so it is part of the played
       // signal (captured by the master recorder and by "Instrument" loop takes).
       const out =
         synth.getInstrumentBus() ?? synth.getOutputBus() ?? audioCtx.destination;
-      const voc = new Vocoder(audioCtx, carrier, out, {
-        bands: 24,
-        strength: vocoderStrength,
+      const harm = new Harmonizer(audioCtx, out, {
+        maxVoices: harmonizerVoices,
+        dryWet: harmonizerDryWet,
+        outputLevel: harmonizerLevel,
       });
-      // Read the SHARED mic hub, not a fresh source node, so the looper keeps
-      // receiving the voice while the vocoder is on.
-      voc.setModulatorNode(micNode);
-      voc.setMicGain(micGain);
-      // Hand mode starts dry (open your hand to bring it in); manual mode uses
-      // the wet/dry slider value.
-      voc.start(
-        (val) => synth.setDryGain(val),
-        handVocoder ? 0 : vocoderWet
-      );
-      vocoderRef.current = voc;
-      setVocoderOn(true);
+      // Read the SHARED mic hub, not a fresh source node, so the looper and the
+      // level meter keep receiving the voice while the harmonizer is on.
+      harm.connect(micNode);
+      harm.start();
+      harmonizerRef.current = harm;
+      setHarmonizerOn(true);
     },
-    [micGain, getSharedMic, vocoderStrength, handVocoder, vocoderWet]
+    [getSharedMic, harmonizerVoices, harmonizerDryWet, harmonizerLevel]
   );
 
-  // Record the full output (effects + vocoder + drums) via MediaRecorder.
+  // Record the full output (effects + harmonizer + drums) via MediaRecorder.
   const pickMime = (): string => {
     const candidates = [
       "audio/webm;codecs=opus",
@@ -946,7 +941,7 @@ export default function SimpleMode() {
           /* ignore */
         }
       }
-      vocoderRef.current?.dispose();
+      harmonizerRef.current?.dispose();
       micStreamRef.current?.getTracks().forEach((t) => t.stop());
       const v = videoRef.current;
       if (v && v.srcObject) {
@@ -1080,8 +1075,8 @@ export default function SimpleMode() {
                   {arpOn && <span className="text-orange">· arp</span>}
                   {latchOn && <span className="text-yellow"> · latch</span>}
                   {drumsOn && <span className="text-orange"> · drums</span>}
-                  {vocoderOn && (
-                    <span className="text-magenta"> · vocoder</span>
+                  {harmonizerOn && (
+                    <span className="text-magenta"> · harmonizer</span>
                   )}
                 </div>
                 <div className="text-2xl font-semibold">
@@ -1342,7 +1337,7 @@ export default function SimpleMode() {
               </div>
             </div>
             <p className="mt-2 text-xs text-white/55">
-              Captures the full output (synth, effects, vocoder, drums) and
+              Captures the full output (synth, effects, harmonizer, drums) and
               downloads a timestamped .webm file.
             </p>
             {!started && (
@@ -1907,25 +1902,26 @@ export default function SimpleMode() {
             </details>
           </section>
 
-          {/* Vocoder */}
+          {/* Vocal harmonizer */}
           <section className="rounded-2xl border border-magenta/30 bg-purple/15 p-4">
             <div className="mb-3 flex items-center justify-between">
               <h2 className="text-sm font-semibold uppercase tracking-wide text-white/70">
-                Vocoder
+                Harmonizer
               </h2>
               <label className="flex items-center gap-2 text-sm">
                 <input
                   type="checkbox"
-                  checked={vocoderOn}
+                  checked={harmonizerOn}
                   disabled={!started}
-                  onChange={(e) => toggleVocoder(e.target.checked)}
+                  onChange={(e) => toggleHarmonizer(e.target.checked)}
                 />
                 On
               </label>
             </div>
             <p className="text-xs text-white/55">
-              Uses your microphone as the modulator and the synth as the
-              carrier: talk or sing for a strong robotic vocoder (24 bands).
+              Sing into your mic and hold a chord with a gesture: your voice is
+              copied onto every tone of that chord. Sing a note and hold C major
+              to hear yourself at C, E and G.
             </p>
             {!started && (
               <p className="mt-2 text-xs text-white/40">
@@ -1936,78 +1932,79 @@ export default function SimpleMode() {
               <p className="mt-2 text-xs text-orange">{micError}</p>
             )}
 
-            <label className="mt-3 flex items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                checked={handVocoder}
-                onChange={(e) => setHandVocoder(e.target.checked)}
-              />
-              Hand-controlled{" "}
-              <span className="text-xs text-white/55">
-                (left hand openness = wet)
+            {/* Live detected-pitch readout so you can see your voice arriving. */}
+            <div className="mt-3 flex items-center justify-between rounded-md bg-purple/25 px-2 py-1.5 text-sm">
+              <span className="text-white/70">Detected pitch</span>
+              <span className="font-mono text-yellow">
+                {harmonizerOn && sungPitch
+                  ? `${freqToNoteLabel(sungPitch)} · ${sungPitch.toFixed(0)} Hz`
+                  : harmonizerOn
+                    ? "listening…"
+                    : "off"}
               </span>
-            </label>
-            <p className="mt-1 text-xs text-white/55">
-              In two-hand mode, open your left hand to bring the vocoder in;
-              a closed left hand (or no left hand) is dry.
+            </div>
+            <p className="mt-1 text-[11px] text-white/45">
+              The input level meter in the Looper panel shows your mic level.
+              Pick the Instrument or Mix loop source to record the harmony.
             </p>
 
-            <label
-              className={`mt-3 block text-sm ${
-                vocoderOn && !handVocoder ? "" : "opacity-50"
-              }`}
-            >
+            <label className={`mt-3 block text-sm ${harmonizerOn ? "" : "opacity-50"}`}>
               <span className="mb-1 block text-white/70">
-                Wet / dry: {(vocoderWet * 100).toFixed(0)}%
-                {handVocoder && (
-                  <span className="ml-1 text-xs text-white/40">
-                    (hand-controlled)
-                  </span>
-                )}
+                Dry / wet: {(harmonizerDryWet * 100).toFixed(0)}%
+                <span className="ml-1 text-xs text-white/40">
+                  (voice → harmonies)
+                </span>
               </span>
               <input
                 type="range"
                 min={0}
                 max={1}
                 step={0.01}
-                disabled={!vocoderOn || handVocoder}
-                value={vocoderWet}
-                onChange={(e) => setVocoderWet(Number(e.target.value))}
+                disabled={!harmonizerOn}
+                value={harmonizerDryWet}
+                onChange={(e) => setHarmonizerDryWet(Number(e.target.value))}
                 className="w-full"
               />
             </label>
 
-            <label className={`mt-2 block text-sm ${vocoderOn ? "" : "opacity-50"}`}>
+            <label className={`mt-2 block text-sm ${harmonizerOn ? "" : "opacity-50"}`}>
               <span className="mb-1 block text-white/70">
-                Intensity: {vocoderStrength.toFixed(2)}×
-              </span>
-              <input
-                type="range"
-                min={0.25}
-                max={3}
-                step={0.05}
-                disabled={!vocoderOn}
-                value={vocoderStrength}
-                onChange={(e) => setVocoderStrength(Number(e.target.value))}
-                className="w-full"
-              />
-            </label>
-
-            <label className={`mt-2 block text-sm ${vocoderOn ? "" : "opacity-50"}`}>
-              <span className="mb-1 block text-white/70">
-                Voice sensitivity: {micGain.toFixed(1)}×
+                Output level: {(harmonizerLevel * 100).toFixed(0)}%
               </span>
               <input
                 type="range"
                 min={0}
-                max={4}
-                step={0.1}
-                disabled={!vocoderOn}
-                value={micGain}
-                onChange={(e) => setMicGain(Number(e.target.value))}
+                max={1}
+                step={0.01}
+                disabled={!harmonizerOn}
+                value={harmonizerLevel}
+                onChange={(e) => setHarmonizerLevel(Number(e.target.value))}
                 className="w-full"
               />
             </label>
+
+            <label className="mt-2 block text-sm">
+              <span className="mb-1 block text-white/70">
+                Voices: {harmonizerVoices}
+                <span className="ml-1 text-xs text-white/40">
+                  (max chord tones)
+                </span>
+              </span>
+              <input
+                type="range"
+                min={1}
+                max={4}
+                step={1}
+                value={harmonizerVoices}
+                onChange={(e) => setHarmonizerVoices(Number(e.target.value))}
+                className="w-full"
+              />
+            </label>
+
+            <p className="mt-3 text-[11px] text-white/45">
+              Real-time pitch shifting in the browser has some latency and
+              artifacts; aim for a recognizable harmony, not a studio effect.
+            </p>
           </section>
 
           {/* Vocal looper */}
@@ -2271,7 +2268,7 @@ export default function SimpleMode() {
             </details>
           </section>
 
-          <Legend mode={mode} twoHand={twoHand} handVocoder={handVocoder} />
+          <Legend mode={mode} twoHand={twoHand} />
         </aside>
       </div>
 

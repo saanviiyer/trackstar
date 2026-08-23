@@ -8,9 +8,9 @@
 //   shared filter -> distortion -> chorus -> delay -> reverb -> tremolo ->
 //   master gain -> dry gain -> destination
 //
-// The vocoder taps `master` as its carrier and crossfades against `dry`, so it
-// still works after this chain (effects are pre-master). The hand-Y cutoff and
-// resonance live on the shared filter, unchanged in placement.
+// `master` -> `dry` -> instrument bus keeps the played signal always audible
+// (effects are pre-master). The hand-Y cutoff and resonance live on the shared
+// filter, unchanged in placement.
 //
 // One voice per chord tone. Chord changes retrigger; a rest releases all
 // voices. All gain changes are ramped to avoid clicks. The AudioContext must be
@@ -97,7 +97,7 @@ export class Synth {
   private master: GainNode | null = null;
   private filter: BiquadFilterNode | null = null;
   private dry: GainNode | null = null;
-  // instrumentBus carries the *played* signal (synth + effects + vocoder +
+  // instrumentBus carries the *played* signal (synth + effects + harmonizer +
   // drums) but NOT the loop-playback tracks, so the looper can tap it to record
   // an "Instrument" loop without feeding loops back into themselves.
   // recordBus = instrumentBus + loop tracks; the master recorder taps recordBus.
@@ -110,8 +110,8 @@ export class Synth {
 
   // Shared microphone hub. There must be exactly ONE MediaStreamAudioSourceNode
   // per mic MediaStream: Chromium feeds only one source node per stream, so a
-  // second node (e.g. the vocoder and the looper each making their own) captures
-  // silence. Every mic consumer (vocoder, looper, producer mixer, level meter)
+  // second node (e.g. the harmonizer and the looper each making their own)
+  // captures silence. Every mic consumer (harmonizer, looper, mixer, meter)
   // taps `micHub` instead of creating its own source node. micHub -> micSink
   // (gain 0) -> destination keeps the mic branch always rendered, so meters and
   // taps read live audio without leaking the mic to the speakers (no feedback).
@@ -162,11 +162,6 @@ export class Synth {
 
   getContext(): AudioContext | null {
     return this.ctx;
-  }
-
-  /** Carrier node for the vocoder (master, post-effects, pre-destination). */
-  getCarrierNode(): GainNode | null {
-    return this.master;
   }
 
   private makeStage(): FxStage {
@@ -276,7 +271,7 @@ export class Synth {
       this.reverb.output.connect(this.tremolo);
       this.tremolo.connect(this.master);
 
-      // instrumentBus = master (synth+effects) + drums + vocoder wet. recordBus
+      // instrumentBus = master (synth+effects) + drums + harmonizer. recordBus
       // = instrumentBus + loop tracks -> destination. The master recorder taps
       // recordBus; the looper taps instrumentBus for "Instrument" loops (so a
       // loop never records itself -> no feedback).
@@ -398,18 +393,6 @@ export class Synth {
     if (!this.ctx || !this.chorus) return;
     const now = this.ctx.currentTime;
     this.chorus.wet.gain.setTargetAtTime(on ? amount : 0, now, 0.05);
-  }
-
-  /** Crossfade the direct (dry) output (used by the vocoder). */
-  setDryGain(v: number, timeConstant = 0.04): void {
-    if (!this.ctx || !this.dry) return;
-    const now = this.ctx.currentTime;
-    this.dry.gain.cancelScheduledValues(now);
-    this.dry.gain.setTargetAtTime(
-      Math.max(0, Math.min(1, v)),
-      now,
-      timeConstant
-    );
   }
 
   setWaveform(w: Waveform): void {
@@ -608,8 +591,8 @@ export class Synth {
   }
 
   /**
-   * The instrument bus: the played signal (synth + effects + vocoder + drums)
-   * WITHOUT the loop tracks. The vocoder connects its wet path here, and the
+   * The instrument bus: the played signal (synth + effects + harmonizer + drums)
+   * WITHOUT the loop tracks. The harmonizer connects its output here, and the
    * looper taps it to record an "Instrument" loop with no feedback path.
    */
   getInstrumentBus(): GainNode | null {

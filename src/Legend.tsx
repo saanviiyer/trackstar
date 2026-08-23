@@ -27,11 +27,9 @@ const PROGRESSION_ROWS: { gesture: string; effect: string }[] = [
 export function Legend({
   mode,
   twoHand,
-  handVocoder,
 }: {
   mode: PlayMode;
   twoHand: boolean;
-  handVocoder: boolean;
 }) {
   const rows = mode === "progression" ? PROGRESSION_ROWS : DIATONIC_ROWS;
   return (
@@ -51,14 +49,6 @@ export function Legend({
             <span className="text-magenta">Left hand open</span>
             <span className="text-right text-white/55">
               +5 degrees → reach vi / vii
-            </span>
-          </li>
-        )}
-        {handVocoder && (
-          <li className="flex justify-between gap-3 py-1.5">
-            <span className="text-magenta">Left hand openness</span>
-            <span className="text-right text-white/55">
-              Vocoder wet (closed = dry, open = full)
             </span>
           </li>
         )}

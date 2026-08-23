@@ -10,7 +10,7 @@
 // captures them too.
 //
 // Feedback safety: an "Instrument" take taps the synth INSTRUMENT bus (synth +
-// effects + vocoder + drums) which does NOT include the loop tracks, so a loop
+// effects + harmonizer + drums) which does NOT include the loop tracks, so a loop
 // never records itself.
 //
 // The pure math (loop length, mix gain, boundary alignment, export duration,
@@ -205,7 +205,7 @@ export class VocalLooper {
 
   // The shared mic tap (the Synth's mic hub). The looper never creates its own
   // MediaStreamAudioSourceNode: only one source node may exist per mic stream,
-  // or the recorder captures silence while another consumer (the vocoder) owns
+  // or the recorder captures silence while another consumer (the harmonizer) owns
   // the stream. See Synth.getMicNode().
   private micSource: AudioNode | null = null;
   private instrumentNode: AudioNode | null = null;
@@ -276,9 +276,9 @@ export class VocalLooper {
 
   /**
    * Provide the shared mic tap node (the Synth's mic hub, the SAME node the
-   * vocoder and the level meter read). The looper does NOT create its own
+   * harmonizer and the level meter read). The looper does NOT create its own
    * MediaStreamAudioSourceNode, so the recorder always receives the user's voice
-   * even while the vocoder is also using the mic.
+   * even while the harmonizer is also using the mic.
    */
   setMicNode(node: AudioNode): void {
     this.micSource = node;
