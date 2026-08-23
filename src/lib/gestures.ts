@@ -96,7 +96,7 @@ const FINGERTIPS = [4, 8, 12, 16, 20];
  * Metric: mean fingertip distance from the wrist, normalized by hand size, then
  * remapped from a closed-hand baseline to a fully-open range. This is a smooth
  * signal (unlike the discrete extended-finger count), which makes it well suited
- * to driving a continuous parameter like the vocoder wet amount.
+ * to driving a continuous parameter like an effect wet amount.
  */
 export function handOpenness(lm: Landmark[]): number {
   const size = handSize(lm);

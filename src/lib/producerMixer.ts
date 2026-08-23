@@ -339,7 +339,7 @@ export class ProducerMixer {
   }
   /**
    * Provide the shared mic tap node (the Synth's mic hub, the SAME node the
-   * vocoder and level meter read). The mixer does NOT create its own
+   * harmonizer and level meter read). The mixer does NOT create its own
    * MediaStreamAudioSourceNode, so cycle takes always contain the user's voice.
    */
   setMicNode(node: AudioNode): void {
