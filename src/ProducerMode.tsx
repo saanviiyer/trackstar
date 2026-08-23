@@ -19,6 +19,9 @@ import { DrumMachine, DRUM_PATTERN_NAMES, type DrumPatternName } from "./lib/dru
 import { LandmarkSmoother } from "./lib/smoothing";
 import { drawHand } from "./lib/draw";
 import { ProducerMixer, type MixerTrackState, type TransportInfo } from "./lib/producerMixer";
+import { sourcesForSelection, type RecordSource } from "./lib/vocalLooper";
+import { InputMeter } from "./lib/meter";
+import { InputLevelMeter } from "./InputLevelMeter";
 import Timeline from "./Timeline";
 import { barBeatFromPosition } from "./lib/transport";
 import {
@@ -122,11 +125,11 @@ export default function ProducerMode() {
   const [countInBars, setCountInBars] = useState<number>(1);
   const [beatsPerBar, setBeatsPerBar] = useState<number>(4);
   const [metronome, setMetronome] = useState<boolean>(false);
-  const [recordSource, setRecordSource] = useState<"instrument" | "mic">(
-    "instrument"
-  );
+  const [recordSource, setRecordSource] = useState<RecordSource>("instrument");
   const [exportCycles, setExportCycles] = useState<number>(2);
   const [mixerError, setMixerError] = useState<string>("");
+  const [micReady, setMicReady] = useState<boolean>(false);
+  const inputMeterRef = useRef<InputMeter | null>(null);
   const [transport, setTransport] = useState<TransportInfo>({
     playing: false,
     recording: false,
@@ -405,6 +408,7 @@ export default function ProducerMode() {
         mixer.setConfig({ bpm: arpBpm, bars: loopBars, free: false, beatsPerBar });
         mixer.setRecordSource(recordSource);
         mixer.setMetronome(metronome);
+        if (!inputMeterRef.current) inputMeterRef.current = new InputMeter(audioCtx);
         mixer.onChange = () => {
           const m = mixerRef.current;
           if (!m) return;
@@ -477,12 +481,59 @@ export default function ProducerMode() {
     return () => window.removeEventListener("beforeunload", warn);
   }, [recording]);
 
+  // Acquire the mic once and route it into the synth's single shared mic hub, so
+  // the mixer recorder and the level meter read ONE source node (only one
+  // MediaStreamAudioSourceNode may exist per stream, or the recorder captures
+  // silence).
   const getSharedMic = useCallback(async (): Promise<MediaStream> => {
     if (micStreamRef.current) return micStreamRef.current;
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     micStreamRef.current = stream;
+    synthRef.current.setMicStream(stream);
+    setMicReady(true);
     return stream;
   }, []);
+
+  // Point the input meter at the node(s) the current source records from.
+  const updateMeterInputs = useCallback((sel: RecordSource) => {
+    const meter = inputMeterRef.current;
+    if (!meter) return;
+    const s = synthRef.current;
+    const nodes: AudioNode[] = [];
+    for (const kind of sourcesForSelection(sel)) {
+      const node = kind === "mic" ? s.getMicNode() : s.getInstrumentBus();
+      if (node) nodes.push(node);
+    }
+    meter.setInputs(nodes);
+  }, []);
+
+  // Choose the record source; request the mic up front for mic/mix so the meter
+  // is live before recording.
+  const selectRecordSource = useCallback(
+    async (sel: RecordSource) => {
+      setRecordSource(sel);
+      setMixerError("");
+      if ((sel === "mic" || sel === "mix") && !micStreamRef.current) {
+        try {
+          await synthRef.current.ensureStarted();
+          await getSharedMic();
+        } catch (err) {
+          setMixerError(
+            err instanceof Error
+              ? `Microphone unavailable: ${err.message}`
+              : "Microphone permission denied."
+          );
+        }
+      }
+      updateMeterInputs(sel);
+    },
+    [getSharedMic, updateMeterInputs]
+  );
+
+  useEffect(() => {
+    if (phase !== "running") return;
+    updateMeterInputs(recordSource);
+  }, [phase, recordSource, micReady, updateMeterInputs]);
 
   const toggleRecord = useCallback(async () => {
     setMixerError("");
@@ -497,9 +548,11 @@ export default function ProducerMode() {
       m.stopRecording();
       return;
     }
-    if (recordSource === "mic") {
+    // Ensure the mic for any source that needs it, then hand the mixer the
+    // SHARED mic hub node (not a fresh source node).
+    if (recordSource === "mic" || recordSource === "mix") {
       try {
-        m.setMicStream(await getSharedMic());
+        await getSharedMic();
       } catch (err) {
         setMixerError(
           err instanceof Error
@@ -508,6 +561,8 @@ export default function ProducerMode() {
         );
         return;
       }
+      const micNode = synthRef.current.getMicNode();
+      if (micNode) m.setMicNode(micNode);
     }
     m.setConfig({ bpm: arpBpm, bars: loopBars, free: false, beatsPerBar });
     m.setRecordSource(recordSource);
@@ -515,10 +570,11 @@ export default function ProducerMode() {
       setMixerError("Selected source is not available.");
       return;
     }
+    updateMeterInputs(recordSource);
     // Cycle recording: count-in, then every pass around the loop lands a new
     // phase-locked take, so the singer keeps stacking harmonies until Stop.
     m.armCycle(countInBars);
-  }, [recordSource, arpBpm, loopBars, beatsPerBar, countInBars, getSharedMic]);
+  }, [recordSource, arpBpm, loopBars, beatsPerBar, countInBars, getSharedMic, updateMeterInputs]);
 
   const togglePlay = useCallback(async () => {
     const m = mixerRef.current;
@@ -657,6 +713,8 @@ export default function ProducerMode() {
       arpRef.current?.stop();
       drumsRef.current?.stop();
       mixerRef.current?.dispose();
+      inputMeterRef.current?.dispose();
+      inputMeterRef.current = null;
       micStreamRef.current?.getTracks().forEach((t) => t.stop());
       const v = videoRef.current;
       if (v && v.srcObject) {
@@ -901,19 +959,39 @@ export default function ProducerMode() {
               Record
               <select
                 value={recordSource}
-                onChange={(e) => setRecordSource(e.target.value as "instrument" | "mic")}
+                onChange={(e) => selectRecordSource(e.target.value as RecordSource)}
                 className="rounded-lg border border-purple/50 bg-purple/25 px-2 py-1"
               >
                 <option value="instrument">Instrument</option>
                 <option value="mic">Mic (voice)</option>
+                <option value="mix">Mix (voice + synth)</option>
               </select>
             </label>
           </div>
+          <div className="mt-3 max-w-sm">
+            <InputLevelMeter
+              meter={inputMeterRef}
+              active={phase === "running"}
+              label={
+                recordSource === "mic"
+                  ? "Mic"
+                  : recordSource === "mix"
+                    ? "Mix"
+                    : "Instrument"
+              }
+              unavailable={
+                (recordSource === "mic" || recordSource === "mix") && !micReady
+                  ? "Microphone not available yet. Pick Mic or Mix to allow it, or check your browser permission."
+                  : null
+              }
+            />
+          </div>
           <p className="mt-2 text-xs text-white/55">
-            Stack vocals: pick Mic, press Record. After the count-in, every pass
-            around the loop drops a new harmony take that loops in sync. Keep
-            singing to layer more, then press Stop recording. Use headphones so
-            the metronome and existing layers are not picked up by the mic.
+            Stack vocals: pick Mic (or Mix for voice + synth), press Record.
+            After the count-in, every pass around the loop drops a new harmony
+            take that loops in sync. Keep singing to layer more, then press Stop
+            recording. Use headphones so the metronome and existing layers are
+            not picked up by the mic.
           </p>
         </div>
 

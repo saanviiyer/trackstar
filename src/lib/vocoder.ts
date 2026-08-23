@@ -165,6 +165,8 @@ export class Vocoder {
   private wet: GainNode; // wet mix (0..1)
   private bands: Band[] = [];
   private micSource: MediaStreamAudioSourceNode | null = null;
+  // The shared mic tap this vocoder reads from (owned by the Synth), if any.
+  private modNode: AudioNode | null = null;
 
   private sensitivity: number;
   private strength: number;
@@ -287,7 +289,30 @@ export class Vocoder {
     return 1.2 + 0.045 * this.bandCount * this.strength;
   }
 
-  /** Attach the microphone MediaStream as the modulator. */
+  /**
+   * Attach the shared mic tap (the Synth's mic hub) as the modulator. Preferred
+   * over setModulatorStream: it reads the single shared MediaStreamAudioSourceNode
+   * instead of creating a second one, which would starve the other mic consumer
+   * (the looper) of audio in Chromium.
+   */
+  setModulatorNode(node: AudioNode): void {
+    if (this.modNode === node) return;
+    if (this.modNode) {
+      try {
+        this.modNode.disconnect(this.modInput);
+      } catch {
+        /* ignore */
+      }
+    }
+    this.modNode = node;
+    node.connect(this.modInput);
+  }
+
+  /**
+   * Attach the microphone MediaStream directly. Fragile when another consumer
+   * also wraps the same stream (Chromium feeds only one source node per stream),
+   * so prefer setModulatorNode() with the Synth's shared mic hub.
+   */
   setModulatorStream(stream: MediaStream): void {
     this.micSource = this.ctx.createMediaStreamSource(stream);
     this.micSource.connect(this.modInput);
@@ -359,6 +384,16 @@ export class Vocoder {
       } catch {
         /* ignore */
       }
+    }
+    // Detach only this vocoder's edge from the shared mic hub; the hub stays
+    // live for the looper and the level meter.
+    if (this.modNode) {
+      try {
+        this.modNode.disconnect(this.modInput);
+      } catch {
+        /* ignore */
+      }
+      this.modNode = null;
     }
     for (const b of this.bands) {
       // Disconnect ONLY this band's carrier tap, not the carrier's other

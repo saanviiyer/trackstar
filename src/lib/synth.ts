@@ -108,6 +108,18 @@ export class Synth {
   private noiseBuf: AudioBuffer | null = null;
   private voices: Voice[] = [];
 
+  // Shared microphone hub. There must be exactly ONE MediaStreamAudioSourceNode
+  // per mic MediaStream: Chromium feeds only one source node per stream, so a
+  // second node (e.g. the vocoder and the looper each making their own) captures
+  // silence. Every mic consumer (vocoder, looper, producer mixer, level meter)
+  // taps `micHub` instead of creating its own source node. micHub -> micSink
+  // (gain 0) -> destination keeps the mic branch always rendered, so meters and
+  // taps read live audio without leaking the mic to the speakers (no feedback).
+  private micStream: MediaStream | null = null;
+  private micSourceNode: MediaStreamAudioSourceNode | null = null;
+  private micHub: GainNode | null = null;
+  private micSink: GainNode | null = null;
+
   // Effects chain
   private fxInput: GainNode | null = null; // filter connects here
   private distortion: FxStage | null = null;
@@ -278,6 +290,15 @@ export class Synth {
       this.drumBus = ctx.createGain();
       this.drumBus.gain.value = 0.9;
       this.drumBus.connect(this.instrumentBus);
+
+      // Shared mic hub, always rendered through a muted sink so taps/meters read
+      // live audio, but silent at the speakers so the mic never feeds back.
+      this.micHub = ctx.createGain();
+      this.micHub.gain.value = 1;
+      this.micSink = ctx.createGain();
+      this.micSink.gain.value = 0;
+      this.micHub.connect(this.micSink);
+      this.micSink.connect(ctx.destination);
     }
     if (this.ctx.state === "suspended") {
       await this.ctx.resume();
@@ -608,6 +629,39 @@ export class Synth {
     return this.recorderDest.stream;
   }
 
+  /**
+   * Attach the shared microphone stream. Creates the single
+   * MediaStreamAudioSourceNode for this stream and routes it into the mic hub.
+   * Idempotent for the same stream; swapping streams disconnects the old source.
+   * Every mic consumer should read `getMicNode()` rather than making its own
+   * source node.
+   */
+  setMicStream(stream: MediaStream): void {
+    if (!this.ctx || !this.micHub) return;
+    if (this.micStream === stream && this.micSourceNode) return;
+    if (this.micSourceNode) {
+      try {
+        this.micSourceNode.disconnect();
+      } catch {
+        /* ignore */
+      }
+      this.micSourceNode = null;
+    }
+    this.micStream = stream;
+    this.micSourceNode = this.ctx.createMediaStreamSource(stream);
+    this.micSourceNode.connect(this.micHub);
+  }
+
+  /** The shared, always-live mic tap. Null until setMicStream() runs. */
+  getMicNode(): AudioNode | null {
+    return this.micSourceNode ? this.micHub : null;
+  }
+
+  /** True once a live mic stream is attached to the hub. */
+  hasMic(): boolean {
+    return this.micSourceNode !== null;
+  }
+
   private noise(): AudioBuffer {
     const ctx = this.ctx!;
     if (!this.noiseBuf) {
@@ -721,6 +775,10 @@ export class Synth {
       this.drumBus = null;
       this.recorderDest = null;
       this.noiseBuf = null;
+      this.micStream = null;
+      this.micSourceNode = null;
+      this.micHub = null;
+      this.micSink = null;
     }
   }
 }

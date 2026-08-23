@@ -203,8 +203,11 @@ export class VocalLooper {
   private loopBus: GainNode;
   private limiter: DynamicsCompressorNode;
 
-  private micStream: MediaStream | null = null;
-  private micSource: MediaStreamAudioSourceNode | null = null;
+  // The shared mic tap (the Synth's mic hub). The looper never creates its own
+  // MediaStreamAudioSourceNode: only one source node may exist per mic stream,
+  // or the recorder captures silence while another consumer (the vocoder) owns
+  // the stream. See Synth.getMicNode().
+  private micSource: AudioNode | null = null;
   private instrumentNode: AudioNode | null = null;
 
   private sp: ScriptProcessorNode | null = null;
@@ -271,11 +274,14 @@ export class VocalLooper {
     this.recordSource = sel;
   }
 
-  /** Provide the shared mic stream (same one the vocoder uses). */
-  setMicStream(stream: MediaStream): void {
-    if (this.micStream === stream && this.micSource) return;
-    this.micStream = stream;
-    this.micSource = this.ctx.createMediaStreamSource(stream);
+  /**
+   * Provide the shared mic tap node (the Synth's mic hub, the SAME node the
+   * vocoder and the level meter read). The looper does NOT create its own
+   * MediaStreamAudioSourceNode, so the recorder always receives the user's voice
+   * even while the vocoder is also using the mic.
+   */
+  setMicNode(node: AudioNode): void {
+    this.micSource = node;
   }
 
   /** Provide the instrument tap node (the synth instrument bus). */
@@ -679,13 +685,8 @@ export class VocalLooper {
     } catch {
       /* ignore */
     }
-    if (this.micSource) {
-      try {
-        this.micSource.disconnect();
-      } catch {
-        /* ignore */
-      }
-      this.micSource = null;
-    }
+    // The mic node is shared and owned by the Synth; just drop the reference.
+    // Any capture edges were already removed in teardownCapture().
+    this.micSource = null;
   }
 }
