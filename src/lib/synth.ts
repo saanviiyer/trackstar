@@ -608,6 +608,12 @@ export class Synth {
     if (!this.recorderDest) {
       this.recorderDest = this.ctx.createMediaStreamDestination();
       this.recordBus.connect(this.recorderDest);
+      // Also fold the raw microphone into the recording (but NOT the speakers):
+      // micHub -> recorderDest only. This way a capture always contains the
+      // user's voice even when the harmonizer is off, while live monitoring stays
+      // off so there is no latency echo or feedback. The mic source swaps under
+      // micHub over time; this hub-level edge persists.
+      if (this.micHub) this.micHub.connect(this.recorderDest);
     }
     return this.recorderDest.stream;
   }
