@@ -195,6 +195,8 @@ export default function SimpleMode() {
   // so the harmonizer can lock its voices onto the held chord's tones.
   const heldChordFreqsRef = useRef<number[]>([]);
   const micStreamRef = useRef<MediaStream | null>(null);
+  // The webcam stream, kept so Record can capture a video of the performer.
+  const cameraStreamRef = useRef<MediaStream | null>(null);
   const rafRef = useRef<number | null>(null);
   const lastVideoTimeRef = useRef<number>(-1);
 
@@ -265,8 +267,10 @@ export default function SimpleMode() {
   // Harmonizer controls
   const [harmonizerOn, setHarmonizerOn] = useState<boolean>(false);
   const [micError, setMicError] = useState<string>("");
-  const [harmonizerLevel, setHarmonizerLevel] = useState<number>(0.9);
-  const [harmonizerDryWet, setHarmonizerDryWet] = useState<number>(0.7);
+  const [harmonizerLevel, setHarmonizerLevel] = useState<number>(1.0);
+  // Fully wet by default: the raw voice is captured into the recording
+  // separately, so the harmonizer adds harmonies on top rather than doubling it.
+  const [harmonizerDryWet, setHarmonizerDryWet] = useState<number>(1.0);
   const [harmonizerVoices, setHarmonizerVoices] = useState<number>(4);
   // Live readout of the detected sung pitch (Hz), for on-screen feedback.
   const [sungPitch, setSungPitch] = useState<number | null>(null);
@@ -622,6 +626,7 @@ export default function SimpleMode() {
         return;
       }
 
+      cameraStreamRef.current = stream;
       const video = videoRef.current!;
       video.srcObject = stream;
       await video.play();
@@ -775,14 +780,13 @@ export default function SimpleMode() {
     [getSharedMic, harmonizerVoices, harmonizerDryWet, harmonizerLevel]
   );
 
-  // Record the full output (effects + harmonizer + drums) via MediaRecorder.
-  const pickMime = (): string => {
-    const candidates = [
-      "audio/webm;codecs=opus",
-      "audio/webm",
-      "audio/ogg;codecs=opus",
-    ];
-    for (const m of candidates) {
+  // Record a video of the performer plus the full audio mix (synths + drums +
+  // effects + harmonizer + loops + the live voice) via MediaRecorder. The mic is
+  // folded into the audio inside Synth.getRecordingStream(); here we add the
+  // webcam video track so Record saves a shareable video of you over the backing
+  // track. Falls back to audio-only if the camera is unavailable.
+  const pickMime = (list: string[]): string => {
+    for (const m of list) {
       if (
         typeof MediaRecorder !== "undefined" &&
         MediaRecorder.isTypeSupported(m)
@@ -792,26 +796,47 @@ export default function SimpleMode() {
     return "";
   };
 
-  const startRecording = useCallback(() => {
+  const startRecording = useCallback(async () => {
     setRecordError("");
     const synth = synthRef.current;
-    const stream = synth.getRecordingStream();
-    if (!stream) {
+    const audioStream = synth.getRecordingStream();
+    if (!audioStream) {
       setRecordError("Start the app (Enable camera & sound) first.");
       return;
     }
+    // Make sure the mic is live so the recording captures the voice, not just
+    // the synths. Recording still proceeds (without voice) if it is denied.
     try {
-      const mimeType = pickMime();
+      await getSharedMic();
+    } catch {
+      /* keep recording; the file just will not contain the voice */
+    }
+
+    const cam = cameraStreamRef.current;
+    const videoTracks = cam ? cam.getVideoTracks() : [];
+    const audioTracks = audioStream.getAudioTracks();
+    const hasVideo = videoTracks.length > 0;
+    const mixed = new MediaStream([...videoTracks, ...audioTracks]);
+
+    const mimeType = hasVideo
+      ? pickMime([
+          "video/webm;codecs=vp9,opus",
+          "video/webm;codecs=vp8,opus",
+          "video/webm",
+        ])
+      : pickMime(["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus"]);
+
+    try {
       const rec = mimeType
-        ? new MediaRecorder(stream, { mimeType })
-        : new MediaRecorder(stream);
+        ? new MediaRecorder(mixed, { mimeType })
+        : new MediaRecorder(mixed);
       chunksRef.current = [];
       rec.ondataavailable = (e) => {
         if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
       };
       rec.onstop = () => {
         const blob = new Blob(chunksRef.current, {
-          type: rec.mimeType || "audio/webm",
+          type: rec.mimeType || (hasVideo ? "video/webm" : "audio/webm"),
         });
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
@@ -820,7 +845,7 @@ export default function SimpleMode() {
           .replace(/[:.]/g, "-")
           .slice(0, 19);
         a.href = url;
-        a.download = `handsynth-${stamp}.webm`;
+        a.download = `trackstar-${stamp}.webm`;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
@@ -839,7 +864,7 @@ export default function SimpleMode() {
         err instanceof Error ? err.message : "Recording failed to start."
       );
     }
-  }, []);
+  }, [getSharedMic]);
 
   const stopRecording = useCallback(() => {
     const rec = recorderRef.current;
@@ -1332,13 +1357,14 @@ export default function SimpleMode() {
                         : "bg-magenta text-ink hover:bg-magenta/80"
                   }`}
                 >
-                  {recording ? "Stop & download" : "Record"}
+                  {recording ? "Stop & download" : "Record video"}
                 </button>
               </div>
             </div>
             <p className="mt-2 text-xs text-white/55">
-              Captures the full output (synth, effects, harmonizer, drums) and
-              downloads a timestamped .webm file.
+              Records a video of you with the full mix (synth, drums, effects,
+              harmonizer, loops and your voice) and downloads a timestamped .webm
+              file. Stack vocals in the Looper below while recording.
             </p>
             {!started && (
               <p className="mt-1 text-xs text-white/40">

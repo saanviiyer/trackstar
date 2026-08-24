@@ -253,6 +253,12 @@ export class Harmonizer {
 
   private lastPitch: number | null = null;
   private lastTargets: number[] = [];
+  // Short pitch hold so brief unvoiced dips (consonants, vibrato troughs) do not
+  // drop the whole harmony out and back in, which sounds choppy. Holds the last
+  // clear pitch for a few update frames before fading.
+  private heldPitch: number | null = null;
+  private holdFrames = 0;
+  private static readonly HOLD_FRAMES = 10;
 
   constructor(
     ctx: BaseAudioContext,
@@ -262,10 +268,17 @@ export class Harmonizer {
     this.ctx = ctx;
     this.out = out;
     this.maxVoices = Math.max(1, Math.min(6, Math.floor(opts.maxVoices ?? 4)));
-    this.dryWet = Math.max(0, Math.min(1, opts.dryWet ?? 0.7));
-    this.outputLevel = Math.max(0, Math.min(1, opts.outputLevel ?? 0.9));
-    this.grainSize = Math.max(256, Math.floor(opts.grainSize ?? 1024));
-    this.detectOpts = opts.detect ?? {};
+    // Default fully wet: the raw voice is captured into the recording elsewhere
+    // (Synth micHub -> recorderDest), so the harmonizer only needs to add the
+    // harmony voices on top rather than doubling the dry voice.
+    this.dryWet = Math.max(0, Math.min(1, opts.dryWet ?? 1.0));
+    this.outputLevel = Math.max(0, Math.min(1, opts.outputLevel ?? 1.0));
+    this.grainSize = Math.max(256, Math.floor(opts.grainSize ?? 1280));
+    // A more permissive gate than the pure-function defaults so a real, slightly
+    // breathy voice through the shifter is not rejected frame to frame (which
+    // reads as choppy). Callers can still override.
+    this.detectOpts =
+      opts.detect ?? { clarityThreshold: 0.5, rmsThreshold: 0.008 };
 
     // Pitch-detection analyser (observes the mic only, no onward output).
     this.analyser = ctx.createAnalyser();
@@ -388,7 +401,18 @@ export class Harmonizer {
     }
     this.analyser.getFloatTimeDomainData(this.analyserBuf);
     const sr = this.ctx.sampleRate;
-    const pitch = detectPitchAutocorr(this.analyserBuf, sr, this.detectOpts);
+    const detected = detectPitchAutocorr(this.analyserBuf, sr, this.detectOpts);
+
+    // Hold the last clear pitch briefly through unvoiced dips to avoid choppy
+    // drop-outs; only truly fade once the hold window expires.
+    let pitch = detected;
+    if (detected !== null) {
+      this.heldPitch = detected;
+      this.holdFrames = Harmonizer.HOLD_FRAMES;
+    } else if (this.holdFrames > 0) {
+      pitch = this.heldPitch;
+      this.holdFrames--;
+    }
     this.lastPitch = pitch;
 
     if (pitch === null || !chordFreqs || chordFreqs.length === 0) {
@@ -401,8 +425,11 @@ export class Harmonizer {
     const harmony = computeHarmony(pitch, chordFreqs, this.maxVoices);
     this.lastTargets = harmony.map((h) => h.targetFreq);
     const active = harmony.length;
-    // Equal-power-ish per-voice gain so more tones do not clip the sum.
-    const perVoice = active > 0 ? 1 / Math.sqrt(active) : 0;
+    // Per-voice gain with makeup so the harmonies sit at a similar level to the
+    // voice/synths instead of a third of it. Equal-power scaling keeps the sum
+    // from clipping as more tones are added; the 1.5 makeup lifts the whole
+    // stack (a single voice reaches full gain).
+    const perVoice = active > 0 ? Math.min(1, 1.5 / Math.sqrt(active)) : 0;
     for (let i = 0; i < this.voices.length; i++) {
       const v = this.voices[i];
       if (i < active) {
