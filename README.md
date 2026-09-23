@@ -1,197 +1,96 @@
 # Trackstar
 
-Trackstar is a hand-gesture instrument and AI music studio in one web app. It fuses two projects
-behind a single top-level mode toggle:
+Trackstar is a hand-gesture instrument and an AI music studio in one web app. You play synth chords with webcam hand gestures, record loops into a multitrack mixer, and can add AI backing stems from the deejai backend.
 
-- **Simple mode** is the full handsynth instrument: play synth chords with
-  webcam hand gestures. Everything runs in the browser, no backend, no uploads.
-- **Producer mode** keeps the hand instrument live but feeds it into a
-  multitrack mixer, and adds AI producer features powered by the deejai Python
-  backend (natural-language commands like "add a lofi beat").
+A toggle at the top switches between two modes. Only one mode is mounted at a time. Switching modes releases the camera and audio of the other mode.
 
-Simple mode and the Producer studio (record and import loops, persistent
-projects, volume/pan/mute/solo, play-all, and export) work with **no backend
-and no keys**. Producer mode's AI
-features are the only part that needs the deejai backend running.
-
-## Quick start
-
-```bash
-npm install
-npm run dev
-```
-
-Open the printed local URL (for example http://localhost:5173). `npm install`
-also vendors the MediaPipe hand-tracking WASM and model into `public/` via the
-postinstall scripts; if that download is skipped (offline install), the app
-falls back to the MediaPipe CDN at runtime.
-
-Build and test:
-
-```bash
-npm run build   # tsc -b + vite build, zero TS errors
-npm test        # vitest, 291 tests
-```
-
-### Deploy
-
-Import this directory into Vercel or Netlify. Both hosts are configured to
-build and serve `dist/` as an SPA. Set `VITE_DEEJAI_URL` in the host's build
-environment to the HTTPS origin of a deployed deejai backend; without it, all
-non-AI instrument and mixer features continue to work.
-
-## The two modes
+## Features
 
 ### Simple mode
 
-The handsynth experience: gestures map to chords/scales, with sound design,
-arpeggiator, drums, bass, vocoder and a vocal looper. Its continuous-stack mode
-captures 2/3/4/6 phase-locked vocal passes hands-free and stops automatically.
-Grant camera access and enable sound to start; the camera feed never leaves
-your device.
+Simple mode is the full handsynth instrument. Gestures map to chords and scales. It includes sound design, an arpeggiator, drums, bass, a vocoder, and a vocal looper. The continuous-stack mode captures 2, 3, 4, or 6 phase-locked vocal passes hands-free and stops by itself. Grant camera access and enable sound to start. Everything runs in the browser. The camera feed never leaves your device.
 
-> Note: Simple mode is a **copy of handsynth** (its `src/lib`, `Legend.tsx`,
-> `index.css`, `public/` assets, WASM/model scripts and config were copied into
-> Trackstar verbatim, with the top-level `App` component rendered here as
-> `SimpleMode`). Future changes in the original handsynth project would need to
-> be re-synced into Trackstar by hand. This keeps the mature instrument isolated
-> from Producer-mode changes while both run in one application.
+Simple mode is a copy of handsynth. Its `src/lib`, `Legend.tsx`, `index.css`, `public/` assets, WASM and model scripts, and config were copied without changes. Its `App` component renders here as `SimpleMode`. Changes in the original handsynth project must be copied into Trackstar by hand.
 
-### Producer mode (the new work)
+### Producer mode
 
-- **Persistent projects.** The studio autosaves decoded audio and mixer state
-  to IndexedDB, restores it after sound is enabled, and preserves the project
-  name, BPM, bar length, volume, pan, mute, and solo settings.
-- **Live instrument -> mixer.** The same hand instrument plays live. Record its
-  output (or your mic) into the mixer as loop tracks. Each track has volume,
-  pan, mute and solo, plus rename, duplicate, download, and deletion. Existing
-  WAV/MP3/M4A/AAC/OGG/FLAC files can be decoded and imported. Play-all starts
-  every track from one shared anchor; Export bounces the mix to stereo WAV.
-- **Custom rhythm section.** Build one-to-four-bar patterns in a six-voice drum
-  grid (kick, snare, clap, hi-hat, tom, shaker), write a key-aware monophonic
-  bassline in the matching piano roll, and shape a four-to-sixteen-bar track by
-  switching drums and bass on or off in each bar. Genre, bassline, and song-form
-  presets provide editable starting points, and the whole composition autosaves.
-- **Vocal Stack recorder.** Pick a tight double, wide triple, four-part harmony,
-  or six-take choir and sing continuously through the loop. Each pass becomes a
-  named, phase-locked take with automatic stereo placement; recording stops at
-  the selected take count. The stack behaves like a take folder with group
-  mute, solo, and clear controls.
-- **GarageBand-style editing.** Timeline regions have persistent colors, clip
-  moves and trims can snap off/to beats/to bars, and every mixer track has a
-  nondestructive tone control that is preserved in saved projects and exports.
-  A per-track Space send feeds a shared stereo room, helping vocal stacks blend;
-  the ambience is matched in live playback and exported WAVs.
-  Mixer actions have a 40-step undo/redo history, while Space/R/M/Escape and
-  Cmd/Ctrl+Z provide safe transport and editing shortcuts outside text fields.
-  Vocal takes can be starred as comp picks and auditioned together.
-- **AI producer (deejai).** Type a natural-language command ("add a lofi beat",
-  "add a warm pad backing in C", "add a trap beat"). Trackstar runs it against a
-  deejai session, fetches the returned stem WAVs, decodes them into
-  AudioBuffers, and drops the backing stems (beat / pad / bass / arp) into the
-  same mixer alongside your loops. It shows deejai's messages and the detected
-  tempo / key / beat style.
+- Persistent projects. The studio autosaves decoded audio and mixer state to IndexedDB and restores it after you enable sound. It keeps the project name, BPM, bar length, and each track's volume, pan, mute, and solo.
+- Live instrument into the mixer. Record the hand instrument (or your mic) as loop tracks. You can rename, duplicate, download, or delete each track. You can also import WAV, MP3, M4A, AAC, OGG, or FLAC files. Play-all starts every track from one shared anchor. Export writes the mix to a stereo WAV.
+- Rhythm section. Build one-to-four-bar patterns in a six-voice drum grid (kick, snare, clap, hi-hat, tom, shaker). Write a key-aware monophonic bassline in the piano roll. Arrange a four-to-sixteen-bar track by turning drums and bass on or off per bar. Genre, bassline, and song-form presets give editable starting points. The composition autosaves.
+- Vocal Stack recorder. Pick a tight double, wide triple, four-part harmony, or six-take choir, and sing through the loop. Each pass becomes a named, phase-locked take with automatic stereo placement. Recording stops at the selected take count. The stack works like a take folder with group mute, solo, and clear.
+- Editing. Timeline regions keep their colors. Clip moves and trims can snap to beats or bars, or snap can be off. Each track has a nondestructive tone control that saved projects and exports keep. A per-track Space send feeds a shared stereo room, and live playback and exported WAVs use the same ambience. Mixer actions have 40 steps of undo and redo. Space, R, M, Escape, and Cmd/Ctrl+Z work as shortcuts outside text fields. You can star vocal takes as comp picks and play them together.
+- AI producer (deejai). Type a command such as "add a lofi beat" or "add a warm pad backing in C". Trackstar sends it to a deejai session, fetches the returned stem WAVs, decodes them, and adds the backing stems (beat, pad, bass, arp) to the mixer. It shows deejai's messages and the detected tempo, key, and beat style.
 
-## Shared-AudioContext design
+Simple mode and the Producer studio work with no backend and no keys. Only the AI producer needs deejai.
 
-Producer mode uses **one AudioContext** (the handsynth `Synth`'s context) for
-everything: the live instrument, the recorded loop tracks, and the deejai stem
-tracks. The mixer (`src/lib/producerMixer.ts`) taps the synth's instrument bus
-to record loops, and adds decoded deejai stems as `AudioBufferSourceNode ->
-gain -> stereoPanner -> master bus`. Because loops and AI stems live in the same
-context and start on the same transport anchor, they play together and export
-together. Simple mode and Producer mode each own their context; only one mode is
-mounted at a time, and switching modes releases the other's camera and audio.
+## How it works
 
-The mute/solo mix math is reused from the handsynth looper (`effectiveGain`),
-and the transport-length / boundary helpers are reused too, so the mixer only
-adds pan, stem tracks and stereo export on top of proven logic.
+Producer mode uses one AudioContext (the handsynth `Synth` context) for the live instrument, the recorded loops, and the deejai stems. The mixer in `src/lib/producerMixer.ts` taps the synth's instrument bus to record loops. It plays decoded stems through `AudioBufferSourceNode -> gain -> stereoPanner -> master bus`. Loops and stems share one context and one transport anchor, so they play and export together. The mute and solo math (`effectiveGain`) and the transport-length helpers come from the handsynth looper.
 
-## deejai backend (for Producer AI features)
+## Limits
 
-The AI features talk to the deejai FastAPI backend (the offline Python audio
-engine wrapped in a REST API). Trackstar does not modify deejai.
+- Producer mode has a compact instrument control set: key, scale, octave, chord extension, sound preset, volume, shared tempo, two-hand, latch, arp, and drums. The full sound-design, vocoder, and effects panels are in Simple mode only.
+- Trackstar adds only the AI backing stems. It does not import the demo vocal takes that the engine balances. Your own loops are the takes. The deejai upload, align, lead, and bundle endpoints are not exposed here.
+- Loops and stems start on one anchor. Loops of different lengths share the start but are not resampled to a common bar length. For the tightest sync, set the instrument tempo to the project BPM.
+- Project storage is local to the browser and does not sync across devices. Accounts, sharing, collaboration, and server backups would need a production identity, database, and object-storage backend.
+- IndexedDB autosave recovers from corrupt data and quota errors, and the studio stays usable.
 
-Start it from the deejai project directory (deps: numpy, scipy, soundfile,
-pyloudnorm, fastapi, uvicorn):
+## Run it
+
+```bash
+git clone https://github.com/saanviiyer/trackstar
+cd trackstar
+npm install
+npm run dev        # open the printed URL, for example http://localhost:5173
+```
+
+`npm install` runs postinstall scripts that copy the MediaPipe hand-tracking WASM and model into `public/`. If that download does not happen (offline install), the app loads them from the MediaPipe CDN at runtime.
+
+```bash
+npm run build      # tsc -b, then vite build
+npm test           # vitest, 291 tests
+npm run test:watch
+```
+
+Use Chrome or Edge for best results. The camera needs HTTPS or localhost.
+
+### deejai backend (AI features only)
+
+The AI producer talks to the deejai FastAPI backend, an offline Python audio engine with a REST API. Trackstar does not modify deejai. Start it from the deejai project folder (needs numpy, scipy, soundfile, pyloudnorm, fastapi, and uvicorn):
 
 ```bash
 python3 -m uvicorn app.server:app --port 8000
 ```
 
-### How Trackstar reaches it (CORS / proxy)
+In development, the Vite dev server proxies `/deejai/...` to `http://localhost:8000` (see `vite.config.ts`), so you need no CORS setup. If the backend does not respond, the AI panel shows the `uvicorn` command and a Retry button. The instrument, mixer, and export keep working.
 
-- In dev, the Vite dev server proxies browser calls from `/deejai/...` to
-  `http://localhost:8000` (see `vite.config.ts`), so there is no CORS setup.
-- The client base URL is configurable with `VITE_DEEJAI_URL` (see
-  `.env.example`). Leave it unset to use the `/deejai` dev proxy, or set it to a
-  backend origin, e.g. `VITE_DEEJAI_URL=http://localhost:8000`.
+### Deploy
 
-### Graceful degradation
+Import the repo into Vercel or Netlify. Both configs build and serve `dist/` as a single-page app. Set `VITE_DEEJAI_URL` in the host's build settings to the HTTPS origin of a deployed deejai backend. Without it, all features except the AI producer still work.
 
-If the backend is unreachable, the AI panel shows a clear "Start the deejai
-backend to enable AI features" message with the exact `uvicorn` command and a
-Retry button. The instrument, mixer and export keep working fully without it.
+## Environment variables
 
-## Feature status
+| Name | Purpose | Required |
+| ---- | ------- | -------- |
+| `VITE_DEEJAI_URL` | Base URL of the deejai backend. If unset, the app uses the `/deejai` dev proxy. | Optional |
 
-Fully working:
-
-- Top-level Simple / Producer mode toggle.
-- Simple mode: the complete handsynth instrument.
-- Producer mixer: record live instrument (or mic) loops; import existing audio;
-  rename, duplicate, download, and delete tracks; volume, pan, mute, solo;
-  play-all / stop-all; confirmation-protected clear.
-- Six-voice drum sequencer, key-aware bass piano roll, and bar-by-bar track
-  constructor with editable presets and backward-compatible project restore.
-- Hands-free vocal-stack cycle recording in both modes, Producer take-folder
-  controls, colored regions, beat/bar snapping, per-track tone shaping and
-  shared ambience sends, comp favorites, and 40-step undo/redo.
-- IndexedDB project autosave and restore, with corruption and quota failure
-  recovery that leaves the live studio usable.
-- Export: stereo WAV bounce of the whole mix (with pan) for N cycles.
-- deejai integration: create/reuse a session, run NL commands, fetch + decode
-  stems, add backing stems (beat / pad / bass / arp) to the mixer; show
-  messages and tempo / key / beat style.
-- Graceful degradation when the backend is down.
-
-Deployment boundaries:
-
-- Producer mode ships a **compact** instrument control set (key, scale, octave,
-  chord extension, sound preset, volume, shared tempo, two-hand, latch, arp,
-  drums). The full sound-design / vocoder / effects panels live in Simple mode.
-- deejai integration auto-adds the AI backing stems (beat / pad
-  / bass / arp). The demo vocal takes the engine balances are intentionally not
-  imported as tracks (your own loops are the "takes"). Upload / align / lead /
-  bundle endpoints remain backend capabilities and are not exposed here.
-- Loops and stems start together on one anchor. Loops of different lengths (and
-  a long stem vs short loops) share the start but are not resampled to a common
-  bar length; set the instrument tempo to the project BPM for the tightest sync.
-- Browser-local project storage does not sync across devices. Multi-device
-  accounts, sharing, collaboration, and server-side project backups require a
-  production identity/database/object-storage backend.
-- Simple mode is a maintained copy of handsynth (see the note above).
-
-## Project layout
+## Layout
 
 ```
 src/
-  App.tsx              top-level mode toggle + header
-  SimpleMode.tsx       handsynth, verbatim (rendered as Simple mode)
-  ProducerMode.tsx     live instrument + mixer + AI panel
-  Legend.tsx           handsynth legend (Simple mode)
-  index.css            handsynth styles
+  App.tsx              mode toggle and header
+  SimpleMode.tsx       handsynth app, rendered as Simple mode
+  ProducerMode.tsx     live instrument, mixer, and AI panel
+  BeatSequencer.tsx, BassSequencer.tsx, TrackArranger.tsx, Timeline.tsx
+  Legend.tsx, index.css   handsynth legend and styles
   lib/
-    (handsynth libs)   music, gestures, mapping, synth, drums, arp, vocoder,
-                       vocalLooper, presets, smoothing, handLandmarker, draw
-    producerMixer.ts   NEW: multitrack mixer (loops + deejai stems, pan, export)
-    deejai.ts          NEW: deejai REST client (URLs, session, command, stems)
-    *.test.ts          unit tests (incl. producerMixer.test.ts, deejai.test.ts)
-public/                MediaPipe WASM + hand model (vendored at install)
+    producerMixer.ts   multitrack mixer (loops, stems, pan, export)
+    deejai.ts          deejai REST client
+    projectStore.ts    IndexedDB project save and restore
+    *.ts               handsynth and rhythm libraries (music, gestures, synth, drums, bass, vocalLooper, ...)
+    *.test.ts          unit tests
+scripts/               copy-wasm.mjs, fetch-model.mjs (run on install)
+public/                MediaPipe WASM and hand model (added at install)
 ```
 
-## Tech
-
-Vite + React + TypeScript (strict) + Tailwind. Hand tracking: MediaPipe Tasks
-Vision. Audio: Web Audio API. AI producer: deejai FastAPI backend. Best in
-Chrome / Edge; the camera requires HTTPS or localhost.
+Stack: Vite, React, TypeScript (strict), and Tailwind. Hand tracking uses MediaPipe Tasks Vision. Audio uses the Web Audio API.
