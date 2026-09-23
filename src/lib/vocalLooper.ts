@@ -187,6 +187,12 @@ export interface LooperConfig {
   free: boolean;
 }
 
+export interface LooperCycleProgress {
+  recorded: number;
+  target: number;
+  active: boolean;
+}
+
 /**
  * Audio-graph controller for the looper. Not exercised by unit tests (needs an
  * AudioContext); the pure helpers above are what get tested.
@@ -229,6 +235,10 @@ export class VocalLooper {
   private freeChunks: Float32Array[] = [];
   private nextId = 1;
   private countInTimer: ReturnType<typeof setTimeout> | null = null;
+  private cycleMode = false;
+  private cycleTarget = 0;
+  private cycleRecorded = 0;
+  private cycleSkip = 0;
 
   onChange: (() => void) | null = null;
 
@@ -255,7 +265,7 @@ export class VocalLooper {
   }
 
   get isRecording(): boolean {
-    return this.recording;
+    return this.recording || this.countInTimer !== null;
   }
   get isPlaying(): boolean {
     return this.playing;
@@ -265,6 +275,10 @@ export class VocalLooper {
   }
   get loopDurationSec(): number {
     return this.loopDur;
+  }
+  getCycleProgress(): LooperCycleProgress | null {
+    if (!this.cycleMode && this.cycleTarget <= 0) return null;
+    return { recorded: this.cycleRecorded, target: this.cycleTarget, active: this.isRecording };
   }
 
   setConfig(cfg: LooperConfig): void {
@@ -317,7 +331,23 @@ export class VocalLooper {
    * captures until stopRecording() when it is the first take.
    */
   arm(countInBars: number): void {
-    if (this.recording || !this.canRecord()) return;
+    if (this.isRecording || !this.canRecord()) return;
+    this.cycleMode = false;
+    this.cycleTarget = 0;
+    this.cycleRecorded = 0;
+    this.scheduleCapture(countInBars);
+  }
+
+  /** Continuously capture one phase-locked take per pass, then stop automatically. */
+  armCycle(countInBars: number, takes: number): void {
+    if (this.isRecording || !this.canRecord() || this.cfg.free) return;
+    this.cycleMode = true;
+    this.cycleTarget = Math.max(2, Math.min(12, Math.round(takes) || 3));
+    this.cycleRecorded = 0;
+    this.scheduleCapture(countInBars);
+  }
+
+  private scheduleCapture(countInBars: number): void {
     const barDur = (60 / this.cfg.bpm) * BEATS_PER_BAR;
     const clickBars = Math.max(0, Math.floor(countInBars));
 
@@ -330,7 +360,11 @@ export class VocalLooper {
         }
       }
       const delayMs = clickBars * barDur * 1000;
-      this.countInTimer = setTimeout(() => this.beginCapture(), delayMs);
+      this.countInTimer = setTimeout(() => {
+        this.countInTimer = null;
+        this.beginCapture();
+      }, delayMs);
+      this.onChange?.();
     } else {
       this.beginCapture();
     }
@@ -365,6 +399,16 @@ export class VocalLooper {
     this.writeIdx = 0;
     this.freeChunks = [];
     this.capture = fixedLen > 0 ? new Float32Array(fixedLen) : null;
+    this.cycleSkip = 0;
+    if (this.cycleMode && this.capture) {
+      if (this.loopDur > 0 && this.loopStart !== null) {
+        const boundary = nextLoopBoundary(this.ctx.currentTime, this.loopStart, this.loopDur);
+        this.cycleSkip = Math.max(0, Math.round((boundary - this.ctx.currentTime) * sr));
+      } else {
+        this.loopDur = this.capture.length / sr;
+        this.loopStart = this.ctx.currentTime;
+      }
+    }
 
     const sp = this.ctx.createScriptProcessor(2048, 1, 1);
     const silent = this.ctx.createGain();
@@ -372,7 +416,7 @@ export class VocalLooper {
     src.connect(sp);
     sp.connect(silent);
     silent.connect(this.ctx.destination);
-    sp.onaudioprocess = (e) => this.onAudio(e);
+    sp.onaudioprocess = (e) => this.cycleMode ? this.onCycleAudio(e) : this.onAudio(e);
     this.sp = sp;
     this.silent = silent;
     this.captureSource = src;
@@ -393,15 +437,42 @@ export class VocalLooper {
     }
   }
 
+  private onCycleAudio(e: AudioProcessingEvent): void {
+    if (!this.recording || !this.capture) return;
+    const input = e.inputBuffer.getChannelData(0);
+    let i = 0;
+    if (this.cycleSkip > 0) {
+      const skipped = Math.min(this.cycleSkip, input.length);
+      this.cycleSkip -= skipped;
+      i = skipped;
+    }
+    while (i < input.length && this.recording && this.capture) {
+      const n = Math.min(this.capture.length - this.writeIdx, input.length - i);
+      this.capture.set(input.subarray(i, i + n), this.writeIdx);
+      this.writeIdx += n;
+      i += n;
+      if (this.writeIdx >= this.capture.length) {
+        const finished: Float32Array = this.capture;
+        this.capture = new Float32Array(finished.length);
+        this.writeIdx = 0;
+        this.commitCycleTake(finished);
+      }
+    }
+  }
+
   /** Stop a free-mode first take (fixed takes stop themselves when full). */
   stopRecording(): void {
-    if (!this.recording) return;
     if (this.countInTimer) {
       clearTimeout(this.countInTimer);
       this.countInTimer = null;
       this.recording = false;
       this.teardownCapture();
       this.onChange?.();
+      return;
+    }
+    if (!this.recording) return;
+    if (this.cycleMode) {
+      this.endCycleCapture();
       return;
     }
     if (!this.capture) {
@@ -416,6 +487,27 @@ export class VocalLooper {
       this.writeIdx = buf.length;
     }
     this.finalize();
+  }
+
+  private commitCycleTake(data: Float32Array): void {
+    this.cycleRecorded += 1;
+    const track = this.makeTake(data, `Stack ${this.cycleRecorded}`);
+    const startAt = nextLoopBoundary(this.ctx.currentTime + 0.02, this.loopStart, this.loopDur);
+    this.startTrack(track, startAt);
+    this.playing = true;
+    this.applyMix();
+    if (this.cycleRecorded >= this.cycleTarget) this.endCycleCapture();
+    else this.onChange?.();
+  }
+
+  private endCycleCapture(): void {
+    this.recording = false;
+    this.cycleMode = false;
+    this.capture = null;
+    this.writeIdx = 0;
+    this.cycleSkip = 0;
+    this.teardownCapture();
+    this.onChange?.();
   }
 
   private teardownCapture(): void {
@@ -487,18 +579,12 @@ export class VocalLooper {
     }
   }
 
-  private finalize(): void {
-    this.recording = false;
-    const data = this.capture ?? new Float32Array(1);
-    this.teardownCapture();
-
+  private makeTake(data: Float32Array, name?: string): LoopTrack {
     const sr = this.ctx.sampleRate;
     const buffer = this.ctx.createBuffer(1, data.length, sr);
     buffer.getChannelData(0).set(data);
-
     const gain = this.ctx.createGain();
     gain.connect(this.loopBus);
-
     const track: LoopTrack = {
       id: this.nextId++,
       buffer,
@@ -507,12 +593,21 @@ export class VocalLooper {
       muted: false,
       solo: false,
       volume: 0.9,
-      // Bring a quiet take up so the harmony is clearly present in the stack.
       normGain: normalizeGain(peakAmplitude(data)),
-      name: `Take ${this.nextId - 1}`,
+      name: name ?? `Take ${this.nextId - 1}`,
       recordSource: this.recordSource,
     };
     this.tracks.push(track);
+    return track;
+  }
+
+  private finalize(): void {
+    this.recording = false;
+    const data = this.capture ?? new Float32Array(1);
+    this.teardownCapture();
+
+    const track = this.makeTake(data);
+    const buffer = track.buffer;
     this.capture = null;
     this.freeChunks = [];
 

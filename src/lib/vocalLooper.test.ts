@@ -10,7 +10,85 @@ import {
   encodeWavBytes,
   peakAmplitude,
   normalizeGain,
+  VocalLooper,
 } from "./vocalLooper";
+
+function fakeLooperContext(): AudioContext {
+  const param = (value = 0) => ({
+    value,
+    setTargetAtTime(next: number) {
+      this.value = next;
+    },
+  });
+  const node = () => ({ connect() {}, disconnect() {} });
+  return {
+    currentTime: 0,
+    sampleRate: 8,
+    destination: node(),
+    createGain: () => ({ ...node(), gain: param(1) }),
+    createDynamicsCompressor: () => ({
+      ...node(),
+      threshold: param(),
+      knee: param(),
+      ratio: param(),
+      attack: param(),
+      release: param(),
+    }),
+    createScriptProcessor: () => ({ ...node(), onaudioprocess: null }),
+    createBuffer: (_channels: number, length: number, sampleRate: number) => {
+      const data = new Float32Array(length);
+      return {
+        duration: length / sampleRate,
+        length,
+        sampleRate,
+        numberOfChannels: 1,
+        getChannelData: () => data,
+      };
+    },
+    createBufferSource: () => ({
+      ...node(),
+      buffer: null,
+      loop: false,
+      start() {},
+      stop() {},
+    }),
+  } as unknown as AudioContext;
+}
+
+describe("continuous vocal-stack capture", () => {
+  it("splits consecutive loop passes into takes and stops at the target", () => {
+    const ctx = fakeLooperContext();
+    let processor: ScriptProcessorNode | null = null;
+    ctx.createScriptProcessor = () => {
+      processor = {
+        connect() {},
+        disconnect() {},
+        onaudioprocess: null,
+      } as unknown as ScriptProcessorNode;
+      return processor;
+    };
+    const looper = new VocalLooper(ctx, ctx.destination, () => {});
+    looper.setInstrumentNode({ connect() {}, disconnect() {} } as unknown as AudioNode);
+    // 1 bar at 240 BPM and 8 Hz = exactly 8 samples per pass.
+    looper.setConfig({ bpm: 240, bars: 1, free: false });
+    looper.setRecordSource("instrument");
+    looper.armCycle(0, 3);
+
+    const input = new Float32Array(24).fill(0.25);
+    const event = {
+      inputBuffer: { getChannelData: () => input },
+    } as unknown as AudioProcessingEvent;
+    (processor as ScriptProcessorNode | null)?.onaudioprocess?.(event);
+
+    expect(looper.getStates().map((track) => track.name)).toEqual([
+      "Stack 1",
+      "Stack 2",
+      "Stack 3",
+    ]);
+    expect(looper.getCycleProgress()).toEqual({ recorded: 3, target: 3, active: false });
+    expect(looper.isRecording).toBe(false);
+  });
+});
 
 describe("loop length from BPM + bars", () => {
   it("2 bars at 120 BPM (4/4) is 4 seconds", () => {

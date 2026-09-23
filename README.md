@@ -30,7 +30,7 @@ Build and test:
 
 ```bash
 npm run build   # tsc -b + vite build, zero TS errors
-npm test        # vitest, 166 tests
+npm test        # vitest, 291 tests
 ```
 
 ### Deploy
@@ -44,9 +44,11 @@ non-AI instrument and mixer features continue to work.
 
 ### Simple mode
 
-The handsynth experience, unchanged: gestures map to chords/scales, with sound
-design, arpeggiator, drums, vocoder and a vocal looper. Grant camera access and
-enable sound to start; the camera feed never leaves your device.
+The handsynth experience: gestures map to chords/scales, with sound design,
+arpeggiator, drums, bass, vocoder and a vocal looper. Its continuous-stack mode
+captures 2/3/4/6 phase-locked vocal passes hands-free and stops automatically.
+Grant camera access and enable sound to start; the camera feed never leaves
+your device.
 
 > Note: Simple mode is a **copy of handsynth** (its `src/lib`, `Legend.tsx`,
 > `index.css`, `public/` assets, WASM/model scripts and config were copied into
@@ -65,6 +67,24 @@ enable sound to start; the camera feed never leaves your device.
   pan, mute and solo, plus rename, duplicate, download, and deletion. Existing
   WAV/MP3/M4A/AAC/OGG/FLAC files can be decoded and imported. Play-all starts
   every track from one shared anchor; Export bounces the mix to stereo WAV.
+- **Custom rhythm section.** Build one-to-four-bar patterns in a six-voice drum
+  grid (kick, snare, clap, hi-hat, tom, shaker), write a key-aware monophonic
+  bassline in the matching piano roll, and shape a four-to-sixteen-bar track by
+  switching drums and bass on or off in each bar. Genre, bassline, and song-form
+  presets provide editable starting points, and the whole composition autosaves.
+- **Vocal Stack recorder.** Pick a tight double, wide triple, four-part harmony,
+  or six-take choir and sing continuously through the loop. Each pass becomes a
+  named, phase-locked take with automatic stereo placement; recording stops at
+  the selected take count. The stack behaves like a take folder with group
+  mute, solo, and clear controls.
+- **GarageBand-style editing.** Timeline regions have persistent colors, clip
+  moves and trims can snap off/to beats/to bars, and every mixer track has a
+  nondestructive tone control that is preserved in saved projects and exports.
+  A per-track Space send feeds a shared stereo room, helping vocal stacks blend;
+  the ambience is matched in live playback and exported WAVs.
+  Mixer actions have a 40-step undo/redo history, while Space/R/M/Escape and
+  Cmd/Ctrl+Z provide safe transport and editing shortcuts outside text fields.
+  Vocal takes can be starred as comp picks and auditioned together.
 - **AI producer (deejai).** Type a natural-language command ("add a lofi beat",
   "add a warm pad backing in C", "add a trap beat"). Trackstar runs it against a
   deejai session, fetches the returned stem WAVs, decodes them into
@@ -122,6 +142,11 @@ Fully working:
 - Producer mixer: record live instrument (or mic) loops; import existing audio;
   rename, duplicate, download, and delete tracks; volume, pan, mute, solo;
   play-all / stop-all; confirmation-protected clear.
+- Six-voice drum sequencer, key-aware bass piano roll, and bar-by-bar track
+  constructor with editable presets and backward-compatible project restore.
+- Hands-free vocal-stack cycle recording in both modes, Producer take-folder
+  controls, colored regions, beat/bar snapping, per-track tone shaping and
+  shared ambience sends, comp favorites, and 40-step undo/redo.
 - IndexedDB project autosave and restore, with corruption and quota failure
   recovery that leaves the live studio usable.
 - Export: stereo WAV bounce of the whole mix (with pan) for N cycles.

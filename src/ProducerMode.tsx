@@ -15,10 +15,30 @@ import {
 import { Synth } from "./lib/synth";
 import { PRESET_NAMES, getPreset, DEFAULT_PRESET } from "./lib/presets";
 import { Arpeggiator } from "./lib/arp";
-import { DrumMachine, DRUM_PATTERN_NAMES, type DrumPatternName } from "./lib/drums";
+import {
+  DrumMachine,
+  DRUM_PATTERN_CHOICES,
+  CUSTOM_PATTERN,
+  emptyPattern,
+  resolvePattern,
+  type DrumPattern,
+  type DrumPatternChoice,
+} from "./lib/drums";
+import BeatSequencer from "./BeatSequencer";
+import BassSequencer from "./BassSequencer";
+import TrackArranger from "./TrackArranger";
+import { bassPatternFromPreset, type BassPattern } from "./lib/bass";
+import { createArrangement, type TrackArrangement } from "./lib/arrangement";
 import { LandmarkSmoother } from "./lib/smoothing";
 import { drawHand } from "./lib/draw";
-import { ProducerMixer, type MixerTrackState, type TransportInfo } from "./lib/producerMixer";
+import {
+  ProducerMixer,
+  type MixerTrackState,
+  type MixerHistoryState,
+  type TransportInfo,
+  type VocalStackPlan,
+  type VocalStackProgress,
+} from "./lib/producerMixer";
 import { sourcesForSelection, type RecordSource } from "./lib/vocalLooper";
 import { InputMeter } from "./lib/meter";
 import { InputLevelMeter } from "./InputLevelMeter";
@@ -28,6 +48,8 @@ import {
   cleanProjectName,
   clearAutosave,
   loadAutosave,
+  sanitizeCompositionState,
+  sanitizeDrumState,
   saveAutosave,
   type TrackstarProject,
 } from "./lib/projectStore";
@@ -59,6 +81,13 @@ const AI_STEM_ROLES = new Set(["beat", "pad", "bass", "arp"]);
 
 const UVICORN_CMD =
   "python3 -m uvicorn app.server:app --port 8000";
+
+const VOCAL_STACK_PRESETS: Array<{ id: string; label: string; detail: string; plan: Omit<VocalStackPlan, "name"> }> = [
+  { id: "double", label: "Tight double", detail: "2 centered takes", plan: { takes: 2, spread: 0.18 } },
+  { id: "wide", label: "Wide triple", detail: "L · C · R", plan: { takes: 3, spread: 0.62 } },
+  { id: "harmony", label: "Harmony stack", detail: "4 layered parts", plan: { takes: 4, spread: 0.78 } },
+  { id: "choir", label: "Mini choir", detail: "6 wide takes", plan: { takes: 6, spread: 0.92 } },
+];
 
 function stamp(): string {
   return new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
@@ -115,10 +144,16 @@ export default function ProducerMode() {
   const [arpOn, setArpOn] = useState<boolean>(false);
   const [arpBpm, setArpBpm] = useState<number>(90);
   const [drumsOn, setDrumsOn] = useState<boolean>(false);
-  const [drumPattern] = useState<DrumPatternName>(DRUM_PATTERN_NAMES[0]);
+  const [drumPattern, setDrumPattern] =
+    useState<DrumPatternChoice>("Four-on-floor");
+  const [customBeat, setCustomBeat] = useState<DrumPattern>(() => emptyPattern(1));
+  const [bassOn, setBassOn] = useState<boolean>(false);
+  const [customBass, setCustomBass] = useState<BassPattern>(() => bassPatternFromPreset("Root pulse", 0, 1));
+  const [arrangement, setArrangement] = useState<TrackArrangement>(() => createArrangement(8));
 
   // Mixer
   const [tracks, setTracks] = useState<MixerTrackState[]>([]);
+  const [historyState, setHistoryState] = useState<MixerHistoryState>({ canUndo: false, canRedo: false });
   const [recording, setRecording] = useState<boolean>(false);
   const [playing, setPlaying] = useState<boolean>(false);
   const [loopBars, setLoopBars] = useState<number>(2);
@@ -126,6 +161,9 @@ export default function ProducerMode() {
   const [beatsPerBar, setBeatsPerBar] = useState<number>(4);
   const [metronome, setMetronome] = useState<boolean>(false);
   const [recordSource, setRecordSource] = useState<RecordSource>("instrument");
+  const [vocalStackPreset, setVocalStackPreset] = useState("wide");
+  const [vocalStackName, setVocalStackName] = useState("Lead stack");
+  const [vocalStackProgress, setVocalStackProgress] = useState<VocalStackProgress | null>(null);
   const [exportCycles, setExportCycles] = useState<number>(2);
   const [mixerError, setMixerError] = useState<string>("");
   const [micReady, setMicReady] = useState<boolean>(false);
@@ -164,6 +202,10 @@ export default function ProducerMode() {
 
   const base = useMemo(() => deejaiBase(), []);
 
+  // Read the sounding drum step for the sequencer playhead. Stable identity so
+  // the sequencer's rAF loop is not torn down on every render.
+  const getDrumPlayhead = useCallback(() => drumsRef.current?.playheadStep() ?? -1, []);
+
   const restoreProjectIfReady = useCallback(() => {
     if (restoreCompleteRef.current) return;
     const saved = pendingProjectRef.current;
@@ -174,6 +216,17 @@ export default function ProducerMode() {
       setProjectName(cleanProjectName(saved.name));
       setArpBpm(Math.max(60, Math.min(200, Math.round(saved.bpm))));
       setLoopBars([1, 2, 4, 8].includes(saved.bars) ? saved.bars : 2);
+      const drums = sanitizeDrumState(saved.drums);
+      if (drums) {
+        setDrumPattern(drums.choice);
+        setCustomBeat(drums.custom);
+      }
+      const composition = sanitizeCompositionState(saved.composition);
+      if (composition) {
+        setBassOn(composition.bassOn);
+        setCustomBass(composition.bass);
+        setArrangement(composition.arrangement);
+      }
       setSaveStatus(`Restored ${saved.mixer.tracks.length} track${saved.mixer.tracks.length === 1 ? "" : "s"}`);
     } catch {
       pendingProjectRef.current = null;
@@ -197,6 +250,17 @@ export default function ProducerMode() {
           setProjectName(cleanProjectName(saved.name));
           setArpBpm(Math.max(60, Math.min(200, Math.round(saved.bpm))));
           setLoopBars([1, 2, 4, 8].includes(saved.bars) ? saved.bars : 2);
+          const drums = sanitizeDrumState(saved.drums);
+          if (drums) {
+            setDrumPattern(drums.choice);
+            setCustomBeat(drums.custom);
+          }
+          const composition = sanitizeCompositionState(saved.composition);
+          if (composition) {
+            setBassOn(composition.bassOn);
+            setCustomBass(composition.bass);
+            setArrangement(composition.arrangement);
+          }
           setSaveStatus("Enable sound to restore saved audio");
           restoreProjectIfReady();
         }
@@ -247,10 +311,14 @@ export default function ProducerMode() {
     const dm = drumsRef.current;
     if (!dm) return;
     dm.setBpm(arpBpm);
-    dm.setPattern(drumPattern);
-    if (drumsOn && !dm.isRunning) dm.start();
-    else if (!drumsOn && dm.isRunning) dm.stop();
-  }, [drumsOn, drumPattern, arpBpm]);
+    dm.setPattern(resolvePattern(drumPattern, customBeat));
+    dm.setBassPattern(customBass);
+    dm.setBassEnabled(bassOn);
+    dm.setArrangement(arrangement);
+    const shouldRun = drumsOn || bassOn;
+    if (shouldRun && !dm.isRunning) dm.start();
+    else if (!shouldRun && dm.isRunning) dm.stop();
+  }, [drumsOn, bassOn, drumPattern, customBeat, customBass, arrangement, arpBpm]);
 
   useEffect(() => {
     const m = mixerRef.current;
@@ -390,12 +458,19 @@ export default function ProducerMode() {
         drumsRef.current = new DrumMachine(audioCtx, {
           kick: (t) => s.triggerKick(t),
           snare: (t) => s.triggerSnare(t),
+          clap: (t) => s.triggerClap(t),
           hat: (t) => s.triggerHat(t),
+          tom: (t) => s.triggerTom(t),
+          shaker: (t) => s.triggerShaker(t),
+          bass: (midi, t, gate) => s.triggerBass(midi, t, gate),
           click: (t, accent) => s.triggerClick(t, accent),
         });
         drumsRef.current.setBpm(arpBpm);
-        drumsRef.current.setPattern(drumPattern);
-        if (drumsOn) drumsRef.current.start();
+        drumsRef.current.setPattern(resolvePattern(drumPattern, customBeat));
+        drumsRef.current.setBassPattern(customBass);
+        drumsRef.current.setBassEnabled(bassOn);
+        drumsRef.current.setArrangement(arrangement);
+        if (drumsOn || bassOn) drumsRef.current.start();
       }
       if (audioCtx && !mixerRef.current) {
         const s = synthRef.current;
@@ -415,6 +490,8 @@ export default function ProducerMode() {
           setTracks(m.getStates());
           setRecording(m.isRecording);
           setPlaying(m.isPlaying);
+          setVocalStackProgress(m.getVocalStackProgress());
+          setHistoryState(m.getHistoryState());
         };
         mixerRef.current = mixer;
       }
@@ -449,7 +526,7 @@ export default function ProducerMode() {
       setPhase("error");
       setErrorMsg(err instanceof Error ? err.message : String(err));
     }
-  }, [loop, volume, presetName, arpBpm, drumPattern, drumsOn, loopBars, recordSource, beatsPerBar, metronome, restoreProjectIfReady]);
+  }, [loop, volume, presetName, arpBpm, drumPattern, customBeat, customBass, arrangement, drumsOn, bassOn, loopBars, recordSource, beatsPerBar, metronome, restoreProjectIfReady]);
 
   useEffect(() => {
     if (!projectLoaded || !restoreCompleteRef.current || !mixerRef.current) return;
@@ -464,12 +541,14 @@ export default function ProducerMode() {
         bpm: arpBpm,
         bars: loopBars,
         mixer: mixer.createSnapshot(),
+        drums: { choice: drumPattern, custom: customBeat },
+        composition: { bassOn, bass: customBass, arrangement },
       })
         .then(() => setSaveStatus("Saved locally"))
         .catch(() => setSaveStatus("Autosave failed, export important tracks"));
     }, 700);
     return () => window.clearTimeout(timer);
-  }, [tracks, projectName, arpBpm, loopBars, projectLoaded]);
+  }, [tracks, projectName, arpBpm, loopBars, drumPattern, customBeat, bassOn, customBass, arrangement, projectLoaded]);
 
   useEffect(() => {
     const warn = (event: BeforeUnloadEvent) => {
@@ -576,6 +655,42 @@ export default function ProducerMode() {
     m.armCycle(countInBars);
   }, [recordSource, arpBpm, loopBars, beatsPerBar, countInBars, getSharedMic, updateMeterInputs]);
 
+  const startVocalStack = useCallback(async () => {
+    setMixerError("");
+    const m = mixerRef.current;
+    if (!m) {
+      setMixerError("Enable camera & sound first.");
+      return;
+    }
+    await synthRef.current.ensureStarted();
+    if (m.isRecording) {
+      m.stopRecording();
+      return;
+    }
+    try {
+      await getSharedMic();
+    } catch (err) {
+      setMixerError(
+        err instanceof Error ? `Microphone unavailable: ${err.message}` : "Microphone permission denied."
+      );
+      return;
+    }
+    const micNode = synthRef.current.getMicNode();
+    if (micNode) m.setMicNode(micNode);
+    const preset = VOCAL_STACK_PRESETS.find((item) => item.id === vocalStackPreset) ?? VOCAL_STACK_PRESETS[1];
+    setRecordSource("mic");
+    setMetronome(true);
+    m.setMetronome(true);
+    m.setConfig({ bpm: arpBpm, bars: loopBars, free: false, beatsPerBar });
+    m.setRecordSource("mic");
+    updateMeterInputs("mic");
+    m.armCycle(Math.max(1, countInBars), {
+      name: vocalStackName.replace(/[\u0000-\u001f]/g, " ").trim().slice(0, 60) || "Vocal stack",
+      ...preset.plan,
+    });
+    setVocalStackProgress(m.getVocalStackProgress());
+  }, [arpBpm, beatsPerBar, countInBars, getSharedMic, loopBars, updateMeterInputs, vocalStackName, vocalStackPreset]);
+
   const togglePlay = useCallback(async () => {
     const m = mixerRef.current;
     if (!m) return;
@@ -583,6 +698,41 @@ export default function ProducerMode() {
     if (m.isPlaying) m.stopAll();
     else m.playAll();
   }, []);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (
+        target?.isContentEditable ||
+        target?.tagName === "INPUT" ||
+        target?.tagName === "TEXTAREA" ||
+        target?.tagName === "SELECT" ||
+        target?.tagName === "BUTTON"
+      ) return;
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "z") {
+        event.preventDefault();
+        if (event.shiftKey) mixerRef.current?.redo();
+        else mixerRef.current?.undo();
+      } else if (event.code === "Space") {
+        event.preventDefault();
+        void togglePlay();
+      } else if (event.key.toLowerCase() === "r" && !event.metaKey && !event.ctrlKey) {
+        event.preventDefault();
+        void toggleRecord();
+      } else if (event.key.toLowerCase() === "m" && !event.metaKey && !event.ctrlKey) {
+        event.preventDefault();
+        setMetronome((on) => {
+          mixerRef.current?.setMetronome(!on);
+          return !on;
+        });
+      } else if (event.key === "Escape") {
+        mixerRef.current?.stopRecording();
+        mixerRef.current?.stopAll();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [togglePlay, toggleRecord]);
 
   const getPeaks = useCallback(
     (id: number, buckets: number) => mixerRef.current?.getPeaks(id, buckets) ?? null,
@@ -629,9 +779,15 @@ export default function ProducerMode() {
   const newProject = useCallback(async () => {
     if (tracks.length > 0 && !window.confirm("Clear every track and start a new project? Export anything you want to keep first.")) return;
     mixerRef.current?.clearAll();
+    mixerRef.current?.clearHistory();
     pendingProjectRef.current = null;
     restoreCompleteRef.current = true;
     setProjectName("Untitled project");
+    setDrumPattern("Four-on-floor");
+    setCustomBeat(emptyPattern(1));
+    setBassOn(false);
+    setCustomBass(bassPatternFromPreset("Root pulse", 0, 1));
+    setArrangement(createArrangement(8));
     loadedStemFilesRef.current.clear();
     try {
       await clearAutosave();
@@ -727,11 +883,17 @@ export default function ProducerMode() {
   const running = phase === "running";
   const started = running || phase === "camera-denied";
   const anySolo = tracks.some((t) => t.solo);
+  const vocalTracks = tracks.filter((t) => t.role === "vocal-stack");
+  const vocalStackMuted = vocalTracks.length > 0 && vocalTracks.every((t) => t.muted);
+  const vocalStackSolo = vocalTracks.length > 0 && vocalTracks.every((t) => t.solo);
+  const vocalFavorites = vocalTracks.filter((t) => t.favorite);
+  const vocalFavoritesAuditioning = vocalFavorites.length > 0 && vocalFavorites.every((t) => t.solo);
+  const selectedVocalPreset = VOCAL_STACK_PRESETS.find((item) => item.id === vocalStackPreset) ?? VOCAL_STACK_PRESETS[1];
 
   return (
     <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
       {/* Stage + mixer */}
-      <div className="relative">
+      <div className="relative min-w-0">
         <div
           className="relative aspect-video w-full overflow-hidden rounded-2xl border-2 border-magenta bg-ink"
           style={{ boxShadow: "0 0 24px rgba(208,0,255,0.35)" }}
@@ -890,6 +1052,9 @@ export default function ProducerMode() {
                 );
               })()}
             </div>
+            <span className="ml-auto hidden text-[10px] text-white/35 sm:inline">
+              Space play · R record · M metronome · ⌘Z undo
+            </span>
           </div>
 
           <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
@@ -986,13 +1151,119 @@ export default function ProducerMode() {
               }
             />
           </div>
-          <p className="mt-2 text-xs text-white/55">
-            Stack vocals: pick Mic (or Mix for voice + synth), press Record.
-            After the count-in, every pass around the loop drops a new harmony
-            take that loops in sync. Keep singing to layer more, then press Stop
-            recording. Use headphones so the metronome and existing layers are
-            not picked up by the mic.
-          </p>
+          <div className="mt-4 rounded-xl border border-cyan-300/30 bg-cyan-300/[0.06] p-3">
+            <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h3 className="text-sm font-semibold text-cyan-200">Vocal Stack</h3>
+                <p className="text-[11px] text-white/50">GarageBand-style cycle recording with automatic take lanes and stereo spread.</p>
+              </div>
+              {vocalStackProgress && (
+                <span className="rounded-full bg-ink/50 px-2 py-1 text-xs text-cyan-100" role="status">
+                  {vocalStackProgress.recorded}/{vocalStackProgress.target} takes
+                </span>
+              )}
+            </div>
+
+            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+              {VOCAL_STACK_PRESETS.map((preset) => (
+                <button
+                  key={preset.id}
+                  type="button"
+                  disabled={recording}
+                  onClick={() => setVocalStackPreset(preset.id)}
+                  aria-pressed={vocalStackPreset === preset.id}
+                  className={`rounded-lg border px-2 py-2 text-left transition ${
+                    vocalStackPreset === preset.id
+                      ? "border-cyan-200 bg-cyan-300 text-ink"
+                      : "border-white/10 bg-purple/20 text-white/80 hover:border-cyan-200/50"
+                  } disabled:opacity-50`}
+                >
+                  <span className="block text-xs font-semibold">{preset.label}</span>
+                  <span className="block text-[10px] opacity-70">{preset.detail}</span>
+                </button>
+              ))}
+            </div>
+
+            <div className="mt-3 flex flex-wrap items-end gap-2">
+              <label className="min-w-[150px] flex-1 text-[11px] text-white/55">
+                Stack name
+                <input
+                  value={vocalStackName}
+                  maxLength={60}
+                  disabled={recording}
+                  onChange={(event) => setVocalStackName(event.target.value)}
+                  className="mt-1 w-full rounded-lg border border-white/15 bg-ink/35 px-2 py-1.5 text-sm text-white"
+                />
+              </label>
+              <button
+                type="button"
+                onClick={startVocalStack}
+                disabled={!started}
+                className={`rounded-lg px-4 py-2 text-sm font-semibold transition ${
+                  !started
+                    ? "cursor-not-allowed bg-purple/25 text-white/40"
+                    : recording
+                      ? "bg-orange text-ink"
+                      : "bg-cyan-300 text-ink hover:bg-cyan-200"
+                }`}
+              >
+                {recording
+                  ? (vocalStackProgress?.active ? "Stop stack" : "Stop recording")
+                  : `Record ${selectedVocalPreset.plan.takes} takes`}
+              </button>
+            </div>
+
+            {vocalStackProgress && (
+              <div className="mt-2 flex gap-1" aria-label="Vocal stack take progress">
+                {Array.from({ length: vocalStackProgress.target }, (_, index) => (
+                  <span
+                    key={index}
+                    className={`h-1.5 flex-1 rounded-full ${index < vocalStackProgress.recorded ? "bg-cyan-300" : "bg-white/15"}`}
+                  />
+                ))}
+              </div>
+            )}
+
+            {vocalTracks.length > 0 && (
+              <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-white/10 pt-2 text-xs">
+                <span className="text-white/50">Take folder · {vocalTracks.length}</span>
+                <button
+                  type="button"
+                  onClick={() => mixerRef.current?.setRoleMute("vocal-stack", !vocalStackMuted)}
+                  className={`rounded px-2 py-1 ${vocalStackMuted ? "bg-orange text-ink" : "bg-purple/30"}`}
+                >
+                  {vocalStackMuted ? "Unmute stack" : "Mute stack"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => mixerRef.current?.setRoleSolo("vocal-stack", !vocalStackSolo)}
+                  className={`rounded px-2 py-1 ${vocalStackSolo ? "bg-yellow text-ink" : "bg-purple/30"}`}
+                >
+                  {vocalStackSolo ? "Unsolo stack" : "Solo stack"}
+                </button>
+                <button
+                  type="button"
+                  disabled={vocalFavorites.length === 0}
+                  onClick={() => mixerRef.current?.auditionFavoriteTakes("vocal-stack", !vocalFavoritesAuditioning)}
+                  className={`rounded px-2 py-1 disabled:opacity-40 ${vocalFavoritesAuditioning ? "bg-cyan-300 text-ink" : "bg-purple/30"}`}
+                >
+                  {vocalFavoritesAuditioning ? "Hear full mix" : `Audition picks (${vocalFavorites.length})`}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (window.confirm("Delete every take in this vocal stack?")) mixerRef.current?.deleteRole("vocal-stack");
+                  }}
+                  className="rounded bg-purple/30 px-2 py-1 text-white/70"
+                >
+                  Clear stack
+                </button>
+              </div>
+            )}
+            <p className="mt-2 text-[11px] text-white/45">
+              Put on headphones, sing one pass per loop, and change harmony each time. Recording stops automatically when the stack is full.
+            </p>
+          </div>
         </div>
 
         {/* TIMELINE */}
@@ -1039,15 +1310,31 @@ export default function ProducerMode() {
               {saveStatus}. Audio and mixer settings stay in this browser.
             </span>
           </div>
-          <div className="mb-3 flex items-center justify-between">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
             <h2 className="text-sm font-semibold uppercase tracking-wide text-white/70">
               Mixer <span className="text-white/40">({tracks.length})</span>
               {recording && <span className="text-orange"> · recording</span>}
             </h2>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => mixerRef.current?.undo()}
+                disabled={!historyState.canUndo || recording}
+                className="rounded-lg bg-purple/35 px-3 py-1.5 text-sm hover:bg-magenta/40 disabled:cursor-not-allowed disabled:opacity-35"
+              >
+                Undo
+              </button>
+              <button
+                type="button"
+                onClick={() => mixerRef.current?.redo()}
+                disabled={!historyState.canRedo || recording}
+                className="rounded-lg bg-purple/35 px-3 py-1.5 text-sm hover:bg-magenta/40 disabled:cursor-not-allowed disabled:opacity-35"
+              >
+                Redo
+              </button>
               <button
                 onClick={() => {
-                  if (window.confirm("Clear all mixer tracks? This cannot be undone.")) {
+                  if (window.confirm("Clear all mixer tracks? You can use Undo until you close this studio.")) {
                     mixerRef.current?.clearAll();
                   }
                 }}
@@ -1099,7 +1386,14 @@ export default function ProducerMode() {
                   key={t.id}
                   className="rounded-lg border border-magenta/20 bg-purple/10 p-2"
                 >
-                  <div className="flex items-center justify-between text-sm">
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
+                    <input
+                      type="color"
+                      value={t.color}
+                      aria-label={`${t.name} region color`}
+                      onChange={(event) => mixerRef.current?.setColor(t.id, event.target.value)}
+                      className="mr-2 h-6 w-6 shrink-0 cursor-pointer rounded border-0 bg-transparent p-0"
+                    />
                     <span className="min-w-0 flex-1 text-white/90">
                       <input
                         aria-label={`Rename ${t.name}`}
@@ -1112,10 +1406,21 @@ export default function ProducerMode() {
                         className="w-full min-w-0 border-0 bg-transparent p-0 text-sm text-white/90 outline-none focus:ring-1 focus:ring-yellow"
                       />{" "}
                       <span className="text-xs text-white/40">
-                        ({t.kind === "stem" ? t.role : t.source})
+                        ({t.role === "vocal-stack" ? "vocal take" : t.kind === "stem" ? t.role : t.source})
                       </span>
                     </span>
-                    <div className="flex items-center gap-1.5">
+                    <div className="ml-auto flex flex-wrap items-center gap-1.5">
+                      {t.role === "vocal-stack" && (
+                        <button
+                          onClick={() => mixerRef.current?.setFavorite(t.id, !t.favorite)}
+                          aria-label={`${t.favorite ? "Unfavorite" : "Favorite"} ${t.name}`}
+                          aria-pressed={t.favorite}
+                          title="Mark this take as a comp pick"
+                          className={`rounded px-2 py-0.5 text-xs ${t.favorite ? "bg-cyan-300 text-ink" : "bg-purple/25 text-white/80"}`}
+                        >
+                          ★
+                        </button>
+                      )}
                       <button
                         onClick={() => mixerRef.current?.setMute(t.id, !t.muted)}
                         aria-label={`${t.muted ? "Unmute" : "Mute"} ${t.name}`}
@@ -1212,6 +1517,39 @@ export default function ProducerMode() {
                       {t.pan === 0 ? "C" : t.pan < 0 ? `L${Math.round(-t.pan * 100)}` : `R${Math.round(t.pan * 100)}`}
                     </span>
                   </div>
+                  <div className="mt-1 flex items-center gap-2">
+                    <span className="w-8 text-xs text-white/50">Tone</span>
+                    <input
+                      aria-label={`${t.name} tone`}
+                      type="range"
+                      min={0}
+                      max={1}
+                      step={0.01}
+                      value={t.tone}
+                      onChange={(e) => mixerRef.current?.setTone(t.id, Number(e.target.value))}
+                      className="w-full"
+                    />
+                    <span className="w-8 text-right text-xs text-white/40">
+                      {t.tone < 0.35 ? "Dark" : t.tone < 0.75 ? "Warm" : "Bright"}
+                    </span>
+                  </div>
+                  <div className="mt-1 flex items-center gap-2">
+                    <span className="w-8 text-xs text-white/50">Space</span>
+                    <input
+                      aria-label={`${t.name} space`}
+                      title="Send this track to the shared studio ambience"
+                      type="range"
+                      min={0}
+                      max={1}
+                      step={0.01}
+                      value={t.space}
+                      onChange={(e) => mixerRef.current?.setSpace(t.id, Number(e.target.value))}
+                      className="w-full"
+                    />
+                    <span className="w-8 text-right text-xs text-white/40">
+                      {Math.round(t.space * 100)}%
+                    </span>
+                  </div>
                 </li>
               ))}
             </ul>
@@ -1255,7 +1593,7 @@ export default function ProducerMode() {
       </div>
 
       {/* Right column: instrument controls + AI panel */}
-      <aside className="flex flex-col gap-4">
+      <aside className="min-w-0 flex flex-col gap-4">
         {/* AI producer panel */}
         <section className="rounded-2xl border border-magenta/30 bg-purple/15 p-4">
           <div className="mb-2 flex items-center justify-between">
@@ -1514,9 +1852,92 @@ export default function ProducerMode() {
                 checked={drumsOn}
                 onChange={(e) => setDrumsOn(e.target.checked)}
               />
-              Drums ({drumPattern})
+              Drums
+            </label>
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={bassOn}
+                onChange={(e) => setBassOn(e.target.checked)}
+              />
+              Bass
             </label>
           </div>
+
+          <label className="mt-3 block text-sm">
+            <span className="mb-1 block text-white/70">Drum pattern</span>
+            <select
+              value={drumPattern}
+              onChange={(e) =>
+                setDrumPattern(e.target.value as DrumPatternChoice)
+              }
+              className="w-full rounded-lg border border-purple/50 bg-purple/25 px-2 py-1.5"
+            >
+              {DRUM_PATTERN_CHOICES.map((n) => (
+                <option key={n} value={n}>
+                  {n === CUSTOM_PATTERN ? "Custom (my beat)" : n}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <details
+            className="mt-3"
+            open={drumPattern === CUSTOM_PATTERN}
+          >
+            <summary className="cursor-pointer list-none text-xs font-semibold uppercase tracking-wide text-white/60">
+              Beat sequencer
+            </summary>
+            <div className="mt-2">
+              <BeatSequencer
+                pattern={customBeat}
+                onChange={(next) => {
+                  setCustomBeat(next);
+                  setDrumPattern(CUSTOM_PATTERN);
+                }}
+                getPlayhead={getDrumPlayhead}
+                running={drumsOn && drumPattern === CUSTOM_PATTERN}
+              />
+              {drumPattern !== CUSTOM_PATTERN && (
+                <p className="mt-1 text-[11px] text-white/45">
+                  Editing here switches the pattern to Custom.
+                </p>
+              )}
+            </div>
+          </details>
+
+          <details className="mt-3" open={bassOn}>
+            <summary className="cursor-pointer list-none text-xs font-semibold uppercase tracking-wide text-cyan-200">
+              Bass sequencer
+            </summary>
+            <div className="mt-2">
+              <BassSequencer
+                pattern={customBass}
+                onChange={(next) => {
+                  setCustomBass(next);
+                  setBassOn(true);
+                }}
+                tonic={tonic}
+                scale={scale}
+                getPlayhead={getDrumPlayhead}
+                running={bassOn}
+              />
+            </div>
+          </details>
+
+          <details className="mt-4" open>
+            <summary className="cursor-pointer list-none text-xs font-semibold uppercase tracking-wide text-yellow">
+              Construct track
+            </summary>
+            <div className="mt-2 rounded-xl border border-white/10 bg-ink/20 p-2">
+              <TrackArranger
+                arrangement={arrangement}
+                onChange={setArrangement}
+                getPlayhead={getDrumPlayhead}
+                running={drumsOn || bassOn}
+              />
+            </div>
+          </details>
         </section>
       </aside>
     </div>

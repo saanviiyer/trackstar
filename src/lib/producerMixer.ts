@@ -53,6 +53,14 @@ export interface MixerTrackState {
   solo: boolean;
   volume: number;
   pan: number; // -1 (L) .. 1 (R)
+  /** One-knob low-pass EQ: 0 = dark, 1 = bright. */
+  tone: number;
+  /** Send level into the shared studio ambience bus. */
+  space: number;
+  /** Region color used by the timeline and mixer. */
+  color: string;
+  /** Marked as a preferred take for vocal comping. */
+  favorite: boolean;
   durationSec: number;
   /** Armed for record (punch-in target). */
   armed: boolean;
@@ -94,12 +102,35 @@ export interface SerializedMixerTrack {
   channels: ArrayBuffer[];
   normGain?: number;
   offsetSec?: number;
+  tone?: number;
+  space?: number;
+  color?: string;
+  favorite?: boolean;
+}
+
+export interface VocalStackPlan {
+  name: string;
+  takes: number;
+  /** Stereo width, 0..1. Takes are distributed evenly across it. */
+  spread: number;
+}
+
+export interface VocalStackProgress {
+  name: string;
+  recorded: number;
+  target: number;
+  active: boolean;
 }
 
 export interface MixerProjectSnapshot {
   version: 1;
   loopDurationSec: number;
   tracks: SerializedMixerTrack[];
+}
+
+export interface MixerHistoryState {
+  canUndo: boolean;
+  canRedo: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +146,44 @@ export function clampPan(pan: number): number {
 export function sanitizeTrackName(name: string, fallback = "Untitled track"): string {
   const clean = name.replace(/[\u0000-\u001f]/g, " ").trim().slice(0, 80);
   return clean || fallback;
+}
+
+export function toneFrequency(tone: number): number {
+  const x = Math.max(0, Math.min(1, Number.isFinite(tone) ? tone : 1));
+  return 500 * Math.pow(40, x); // perceptual 500 Hz .. 20 kHz sweep
+}
+
+/** Build a short deterministic stereo room impulse for live and offline mixes. */
+export function createAmbienceImpulse(
+  ctx: BaseAudioContext,
+  durationSec = 1.25,
+  decay = 3.2
+): AudioBuffer {
+  const length = Math.max(1, Math.round(ctx.sampleRate * durationSec));
+  const buffer = ctx.createBuffer(2, length, ctx.sampleRate);
+  let seed = 0x5f3759df;
+  const noise = () => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    return (seed / 0xffffffff) * 2 - 1;
+  };
+  for (let channel = 0; channel < 2; channel++) {
+    const data = buffer.getChannelData(channel);
+    for (let i = 0; i < length; i++) {
+      const envelope = Math.pow(1 - i / length, decay);
+      data[i] = noise() * envelope * (channel === 0 ? 0.8 : 0.76);
+    }
+  }
+  return buffer;
+}
+
+export function vocalTakePan(index: number, total: number, spread: number): number {
+  if (total <= 1) return 0;
+  const width = Math.max(0, Math.min(1, spread));
+  return clampPan(-width + (2 * width * Math.max(0, Math.min(total - 1, index))) / (total - 1));
+}
+
+export function normalizeTrackColor(value: unknown, fallback = "#ffd400"): string {
+  return typeof value === "string" && /^#[0-9a-f]{6}$/i.test(value) ? value : fallback;
 }
 
 /**
@@ -192,18 +261,49 @@ interface MixerTrack {
   source: RecordSource | "ai";
   buffer: AudioBuffer;
   gain: GainNode;
+  filter: BiquadFilterNode;
   panner: StereoPannerNode;
+  spaceGain: GainNode;
   node: AudioBufferSourceNode | null;
   muted: boolean;
   solo: boolean;
   volume: number;
   pan: number;
+  tone: number;
+  space: number;
+  color: string;
+  favorite: boolean;
   /** Peak-normalization makeup baked at record time (1 for stems/imports). */
   normGain: number;
   /** Armed for punch-in record. */
   armed: boolean;
   /** Clip start offset within the loop (seconds); rotates the looping content. */
   offsetSec: number;
+}
+
+interface MixerHistoryTrack {
+  id: number;
+  name: string;
+  kind: TrackKind;
+  role: string;
+  source: RecordSource | "ai";
+  buffer: AudioBuffer;
+  muted: boolean;
+  solo: boolean;
+  volume: number;
+  pan: number;
+  tone: number;
+  space: number;
+  color: string;
+  favorite: boolean;
+  normGain: number;
+  offsetSec: number;
+}
+
+interface MixerHistorySnapshot {
+  tracks: MixerHistoryTrack[];
+  loopDur: number;
+  playing: boolean;
 }
 
 /**
@@ -220,6 +320,9 @@ export class ProducerMixer {
   // untouched; export mirrors both paths.
   private loopBus: GainNode;
   private limiter: DynamicsCompressorNode;
+  /** Shared short room used by every track's post-pan Space send. */
+  private ambience: ConvolverNode;
+  private ambienceWet: GainNode;
   // Metronome / count-in clicks generated here route only to destination, so a
   // click is NEVER captured into an instrument take.
   private clickGain: GainNode;
@@ -246,6 +349,8 @@ export class ProducerMixer {
   private cycleBuf: Float32Array | null = null;
   private cycleWrite = 0;
   private cycleSkip = 0;
+  private cyclePlan: VocalStackPlan | null = null;
+  private cycleTakesRecorded = 0;
   private countingIn = false;
   private countInEnd = 0;
   private armedTrackId: number | null = null;
@@ -261,6 +366,11 @@ export class ProducerMixer {
   private loopDur = 0; // seconds (from the first recorded loop)
   private playing = false;
   private nextId = 1;
+  private undoStack: MixerHistorySnapshot[] = [];
+  private redoStack: MixerHistorySnapshot[] = [];
+  private restoringHistory = false;
+  private lastHistoryKey = "";
+  private lastHistoryAt = 0;
 
   private cfg: MixerConfig = { bpm: 120, bars: 2, free: false, beatsPerBar: BEATS_PER_BAR };
 
@@ -286,6 +396,13 @@ export class ProducerMixer {
     this.limiter.release.value = 0.15;
     this.loopBus.connect(this.limiter);
     this.limiter.connect(this.output);
+
+    this.ambience = ctx.createConvolver();
+    this.ambience.buffer = createAmbienceImpulse(ctx);
+    this.ambienceWet = ctx.createGain();
+    this.ambienceWet.gain.value = 0.45;
+    this.ambience.connect(this.ambienceWet);
+    this.ambienceWet.connect(this.output);
 
     this.clickGain = ctx.createGain();
     this.clickGain.gain.value = 1;
@@ -368,10 +485,129 @@ export class ProducerMixer {
       solo: t.solo,
       volume: t.volume,
       pan: t.pan,
+      tone: t.tone,
+      space: t.space,
+      color: t.color,
+      favorite: t.favorite,
       durationSec: t.buffer.duration,
       armed: t.armed,
       offsetSec: t.offsetSec,
     }));
+  }
+
+  getHistoryState(): MixerHistoryState {
+    return { canUndo: this.undoStack.length > 0, canRedo: this.redoStack.length > 0 };
+  }
+
+  clearHistory(): void {
+    this.undoStack = [];
+    this.redoStack = [];
+    this.lastHistoryKey = "";
+    this.onChange?.();
+  }
+
+  private captureHistory(): MixerHistorySnapshot {
+    return {
+      tracks: this.tracks.map((track) => ({
+        id: track.id,
+        name: track.name,
+        kind: track.kind,
+        role: track.role,
+        source: track.source,
+        buffer: track.buffer,
+        muted: track.muted,
+        solo: track.solo,
+        volume: track.volume,
+        pan: track.pan,
+        tone: track.tone,
+        space: track.space,
+        color: track.color,
+        favorite: track.favorite,
+        normGain: track.normGain,
+        offsetSec: track.offsetSec,
+      })),
+      loopDur: this.loopDur,
+      playing: this.playing,
+    };
+  }
+
+  private pushHistory(key: string): void {
+    if (this.restoringHistory) return;
+    const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+    if (key === this.lastHistoryKey && now - this.lastHistoryAt < 500) {
+      this.lastHistoryAt = now;
+      return;
+    }
+    this.undoStack.push(this.captureHistory());
+    if (this.undoStack.length > 40) this.undoStack.shift();
+    this.redoStack = [];
+    this.lastHistoryKey = key;
+    this.lastHistoryAt = now;
+  }
+
+  private restoreHistory(snapshot: MixerHistorySnapshot): void {
+    this.restoringHistory = true;
+    for (const track of this.tracks) {
+      this.stopTrackNode(track);
+      try {
+        track.gain.disconnect();
+        track.filter.disconnect();
+        track.panner.disconnect();
+        track.spaceGain.disconnect();
+      } catch {
+        /* ignore */
+      }
+    }
+    this.tracks = [];
+    this.nextId = 1;
+    for (const saved of snapshot.tracks) {
+      const track = this.makeTrack(
+        saved.buffer,
+        saved.name,
+        saved.kind,
+        saved.role,
+        saved.source,
+        saved.pan,
+        saved.normGain,
+        saved.color
+      );
+      track.id = saved.id;
+      track.muted = saved.muted;
+      track.solo = saved.solo;
+      track.volume = saved.volume;
+      track.tone = saved.tone;
+      track.filter.frequency.value = toneFrequency(saved.tone);
+      track.space = saved.space;
+      track.spaceGain.gain.value = saved.space;
+      track.favorite = saved.favorite;
+      track.offsetSec = saved.offsetSec;
+      this.nextId = Math.max(this.nextId, saved.id + 1);
+    }
+    this.loopDur = snapshot.loopDur;
+    this.loopStart = null;
+    this.playing = false;
+    this.applyMix();
+    this.restoringHistory = false;
+    if (snapshot.playing && this.tracks.length > 0) this.playAll();
+    else this.onChange?.();
+  }
+
+  undo(): boolean {
+    if (this.isRecording || this.undoStack.length === 0) return false;
+    const previous = this.undoStack.pop()!;
+    this.redoStack.push(this.captureHistory());
+    this.restoreHistory(previous);
+    this.lastHistoryKey = "";
+    return true;
+  }
+
+  redo(): boolean {
+    if (this.isRecording || this.redoStack.length === 0) return false;
+    const next = this.redoStack.pop()!;
+    this.undoStack.push(this.captureHistory());
+    this.restoreHistory(next);
+    this.lastHistoryKey = "";
+    return true;
   }
 
   // --- track construction ---
@@ -383,16 +619,27 @@ export class ProducerMixer {
     role: string,
     source: RecordSource | "ai",
     pan: number,
-    normGain = 1
+    normGain = 1,
+    color?: string
   ): MixerTrack {
     const gain = this.ctx.createGain();
+    const filter = this.ctx.createBiquadFilter();
+    filter.type = "lowpass";
+    filter.frequency.value = toneFrequency(1);
+    filter.Q.value = 0.7;
     const panner = this.ctx.createStereoPanner();
     panner.pan.value = clampPan(pan);
+    const spaceGain = this.ctx.createGain();
+    const defaultSpace = role === "vocal-stack" ? 0.22 : 0;
+    spaceGain.gain.value = defaultSpace;
     gain.gain.value = 0.9;
-    gain.connect(panner);
+    gain.connect(filter);
+    filter.connect(panner);
     // Recorded loop takes pass through the limiter bus so a harmony stack stays
     // clean; AI stems / imports go straight to the output as before.
     panner.connect(kind === "loop" ? this.loopBus : this.output);
+    panner.connect(spaceGain);
+    spaceGain.connect(this.ambience);
     const track: MixerTrack = {
       id: this.nextId++,
       name,
@@ -401,12 +648,21 @@ export class ProducerMixer {
       source,
       buffer,
       gain,
+      filter,
       panner,
+      spaceGain,
       node: null,
       muted: false,
       solo: false,
       volume: 0.9,
       pan: clampPan(pan),
+      tone: 1,
+      space: defaultSpace,
+      color: normalizeTrackColor(
+        color,
+        role === "vocal-stack" ? "#38bdf8" : kind === "loop" ? "#ffd400" : "#d000ff"
+      ),
+      favorite: false,
       normGain,
       armed: false,
       offsetSec: 0,
@@ -425,6 +681,7 @@ export class ProducerMixer {
     role: string,
     pan = 0
   ): MixerTrackState {
+    this.pushHistory("add-stem");
     const track = this.makeTrack(buffer, name, "stem", role, "ai", pan);
     if (this.playing) {
       const startAt =
@@ -440,6 +697,7 @@ export class ProducerMixer {
 
   /** Add an audio file chosen by the user as a reusable backing track. */
   addImportedTrack(buffer: AudioBuffer, name: string): MixerTrackState {
+    this.pushHistory("import-audio");
     const safeName = sanitizeTrackName(name, `Imported ${this.nextId}`);
     const track = this.makeTrack(buffer, safeName, "stem", "imported", "ai", 0);
     if (this.playing) {
@@ -499,10 +757,28 @@ export class ProducerMixer {
    * immediately loops phase-locked, so the singer keeps layering harmonies until
    * Stop. If a track is armed, this punches one cycle into that track instead.
    */
-  armCycle(countInBars: number): void {
+  armCycle(countInBars: number, plan?: VocalStackPlan): void {
     if (this.isRecording || !this.canRecord()) return;
     this.cycleMode = true;
+    this.cyclePlan = plan
+      ? {
+          name: sanitizeTrackName(plan.name, "Vocal"),
+          takes: Math.max(1, Math.min(12, Math.round(plan.takes) || 1)),
+          spread: clampPan(Math.abs(plan.spread)),
+        }
+      : null;
+    this.cycleTakesRecorded = 0;
     this.scheduleCountIn(countInBars, () => this.beginCycleCapture());
+  }
+
+  getVocalStackProgress(): VocalStackProgress | null {
+    if (!this.cyclePlan) return null;
+    return {
+      name: this.cyclePlan.name,
+      recorded: this.cycleTakesRecorded,
+      target: this.cyclePlan.takes,
+      active: this.isRecording,
+    };
   }
 
   private scheduleCountIn(countInBars: number, onDone: () => void): void {
@@ -670,6 +946,7 @@ export class ProducerMixer {
     if (this.armedTrackId !== null) {
       const target = this.tracks.find((t) => t.id === this.armedTrackId);
       if (target) {
+        this.pushHistory("punch-in");
         this.stopTrackNode(target);
         target.buffer = buffer;
         target.normGain = normalizeGain(peakAmplitude(data));
@@ -690,15 +967,20 @@ export class ProducerMixer {
     }
 
     const cyc = cycleIndex(this.ctx.currentTime, this.loopStart, this.loopDur);
+    const takeIndex = this.cycleTakesRecorded;
+    const plan = this.cyclePlan;
+    this.pushHistory("record-take");
     const track = this.makeTrack(
       buffer,
-      `Take ${this.nextId} (cyc ${cyc + 1})`,
+      plan ? `${plan.name} ${takeIndex + 1}` : `Take ${this.nextId} (cyc ${cyc + 1})`,
       "loop",
-      "loop",
+      plan ? "vocal-stack" : "loop",
       this.recordSource,
-      0,
-      normalizeGain(peakAmplitude(data))
+      plan ? vocalTakePan(takeIndex, plan.takes, plan.spread) : 0,
+      normalizeGain(peakAmplitude(data)),
+      plan ? "#38bdf8" : undefined
     );
+    this.cycleTakesRecorded += 1;
     // Start the take against the EXISTING transport anchor (never re-anchor via
     // playAll here): the capture segments and the playback loop share one clock,
     // so every stacked take stays phase-locked. The take begins on the next loop
@@ -714,6 +996,10 @@ export class ProducerMixer {
     this.startTrack(track, startAt);
     this.playing = true;
     this.applyMix();
+    if (plan && this.cycleTakesRecorded >= plan.takes) {
+      this.endCycleCapture();
+      return;
+    }
     this.onChange?.();
   }
 
@@ -866,6 +1152,7 @@ export class ProducerMixer {
     const sr = this.ctx.sampleRate;
     const buffer = this.ctx.createBuffer(1, data.length, sr);
     buffer.getChannelData(0).set(data);
+    this.pushHistory("record-take");
     const track = this.makeTrack(
       buffer,
       `Take ${this.nextId - 1}`,
@@ -957,6 +1244,7 @@ export class ProducerMixer {
   setTrackOffset(id: number, offsetSec: number): void {
     const t = this.tracks.find((x) => x.id === id);
     if (!t) return;
+    this.pushHistory(`move-${id}`);
     const dur = this.loopDur > 0 ? this.loopDur : t.buffer.duration;
     t.offsetSec = Math.max(0, Math.min(dur, offsetSec));
     if (this.playing && t.node) {
@@ -979,6 +1267,7 @@ export class ProducerMixer {
   trimTrack(id: number, startSec: number, endSec: number): boolean {
     const t = this.tracks.find((x) => x.id === id);
     if (!t || t.kind !== "loop") return false;
+    this.pushHistory(`trim-${id}`);
     const sr = t.buffer.sampleRate;
     const len = t.buffer.length;
     const s = Math.max(0, Math.min(len, Math.round(startSec * sr)));
@@ -1006,6 +1295,7 @@ export class ProducerMixer {
   setMute(id: number, muted: boolean): void {
     const t = this.tracks.find((x) => x.id === id);
     if (t) {
+      this.pushHistory(`mute-${id}`);
       t.muted = muted;
       this.applyMix();
       this.onChange?.();
@@ -1014,6 +1304,7 @@ export class ProducerMixer {
   setSolo(id: number, solo: boolean): void {
     const t = this.tracks.find((x) => x.id === id);
     if (t) {
+      this.pushHistory(`solo-${id}`);
       t.solo = solo;
       this.applyMix();
       this.onChange?.();
@@ -1022,6 +1313,7 @@ export class ProducerMixer {
   setVolume(id: number, volume: number): void {
     const t = this.tracks.find((x) => x.id === id);
     if (t) {
+      this.pushHistory(`volume-${id}`);
       t.volume = Math.max(0, Math.min(1, volume));
       this.applyMix();
       this.onChange?.();
@@ -1030,15 +1322,86 @@ export class ProducerMixer {
   setPan(id: number, pan: number): void {
     const t = this.tracks.find((x) => x.id === id);
     if (t) {
+      this.pushHistory(`pan-${id}`);
       t.pan = clampPan(pan);
       t.panner.pan.setTargetAtTime(t.pan, this.ctx.currentTime, 0.02);
       this.onChange?.();
     }
   }
 
+  setTone(id: number, tone: number): void {
+    const t = this.tracks.find((x) => x.id === id);
+    if (t) {
+      this.pushHistory(`tone-${id}`);
+      t.tone = Math.max(0, Math.min(1, Number.isFinite(tone) ? tone : 1));
+      t.filter.frequency.setTargetAtTime(toneFrequency(t.tone), this.ctx.currentTime, 0.02);
+      this.onChange?.();
+    }
+  }
+
+  setSpace(id: number, space: number): void {
+    const t = this.tracks.find((x) => x.id === id);
+    if (t) {
+      this.pushHistory(`space-${id}`);
+      t.space = Math.max(0, Math.min(1, Number.isFinite(space) ? space : 0));
+      t.spaceGain.gain.setTargetAtTime(t.space, this.ctx.currentTime, 0.02);
+      this.onChange?.();
+    }
+  }
+
+  setColor(id: number, color: string): void {
+    const t = this.tracks.find((x) => x.id === id);
+    if (t) {
+      this.pushHistory(`color-${id}`);
+      t.color = normalizeTrackColor(color, t.color);
+      this.onChange?.();
+    }
+  }
+
+  setFavorite(id: number, favorite: boolean): void {
+    const t = this.tracks.find((x) => x.id === id);
+    if (t) {
+      this.pushHistory(`favorite-${id}`);
+      t.favorite = favorite;
+      this.onChange?.();
+    }
+  }
+
+  setRoleMute(role: string, muted: boolean): void {
+    this.pushHistory(`role-mute-${role}`);
+    for (const track of this.tracks) if (track.role === role) track.muted = muted;
+    this.applyMix();
+    this.onChange?.();
+  }
+
+  setRoleSolo(role: string, solo: boolean): void {
+    this.pushHistory(`role-solo-${role}`);
+    for (const track of this.tracks) if (track.role === role) track.solo = solo;
+    this.applyMix();
+    this.onChange?.();
+  }
+
+  auditionFavoriteTakes(role: string, on: boolean): void {
+    this.pushHistory(`audition-${role}`);
+    for (const track of this.tracks) {
+      if (track.role === role) track.solo = on && track.favorite;
+      else if (on) track.solo = false;
+    }
+    this.applyMix();
+    this.onChange?.();
+  }
+
+  deleteRole(role: string): number {
+    const ids = this.tracks.filter((track) => track.role === role).map((track) => track.id);
+    if (ids.length) this.pushHistory(`delete-role-${role}`);
+    for (const id of ids) this.deleteTrack(id, true);
+    return ids.length;
+  }
+
   renameTrack(id: number, name: string): void {
     const t = this.tracks.find((x) => x.id === id);
     if (t) {
+      this.pushHistory(`rename-${id}`);
       t.name = name.replace(/[\u0000-\u001f]/g, " ").slice(0, 80);
       this.onChange?.();
     }
@@ -1047,6 +1410,7 @@ export class ProducerMixer {
   duplicateTrack(id: number): MixerTrackState | null {
     const source = this.tracks.find((x) => x.id === id);
     if (!source) return null;
+    this.pushHistory(`duplicate-${id}`);
     const copy = this.makeTrack(
       source.buffer,
       `${source.name} copy`.slice(0, 80),
@@ -1060,6 +1424,12 @@ export class ProducerMixer {
     copy.muted = source.muted;
     copy.solo = source.solo;
     copy.offsetSec = source.offsetSec;
+    copy.tone = source.tone;
+    copy.filter.frequency.value = toneFrequency(copy.tone);
+    copy.space = source.space;
+    copy.spaceGain.gain.value = copy.space;
+    copy.color = source.color;
+    copy.favorite = source.favorite;
     if (this.playing) {
       const startAt = this.loopDur > 0
         ? nextLoopBoundary(this.ctx.currentTime + 0.05, this.loopStart, this.loopDur)
@@ -1086,6 +1456,10 @@ export class ProducerMixer {
         pan: track.pan,
         normGain: track.normGain,
         offsetSec: track.offsetSec,
+        tone: track.tone,
+        space: track.space,
+        color: track.color,
+        favorite: track.favorite,
         sampleRate: track.buffer.sampleRate,
         channels: Array.from({ length: track.buffer.numberOfChannels }, (_, channel) => {
           const samples = track.buffer.getChannelData(channel);
@@ -1099,7 +1473,9 @@ export class ProducerMixer {
     if (snapshot.version !== 1 || !Array.isArray(snapshot.tracks)) {
       throw new Error("Unsupported Trackstar project format.");
     }
-    this.clearAll();
+    this.clearAll(true);
+    this.undoStack = [];
+    this.redoStack = [];
     for (const saved of snapshot.tracks) {
       if (
         !saved ||
@@ -1124,26 +1500,39 @@ export class ProducerMixer {
         saved.role || "imported",
         saved.source,
         saved.pan,
-        Number.isFinite(saved.normGain) ? Math.max(0, Math.min(8, saved.normGain as number)) : 1
+        Number.isFinite(saved.normGain) ? Math.max(0, Math.min(8, saved.normGain as number)) : 1,
+        saved.color
       );
       track.muted = !!saved.muted;
       track.solo = !!saved.solo;
       track.volume = Math.max(0, Math.min(1, saved.volume));
       track.offsetSec = Number.isFinite(saved.offsetSec) ? Math.max(0, saved.offsetSec as number) : 0;
+      track.tone = Number.isFinite(saved.tone) ? Math.max(0, Math.min(1, saved.tone as number)) : 1;
+      track.filter.frequency.value = toneFrequency(track.tone);
+      track.space = Number.isFinite(saved.space)
+        ? Math.max(0, Math.min(1, saved.space as number))
+        : saved.role === "vocal-stack"
+          ? 0.22
+          : 0;
+      track.spaceGain.gain.value = track.space;
+      track.favorite = !!saved.favorite;
     }
     this.loopDur = Math.max(0, snapshot.loopDurationSec || 0);
     this.applyMix();
     this.onChange?.();
   }
 
-  deleteTrack(id: number): void {
+  deleteTrack(id: number, skipHistory = false): void {
     const idx = this.tracks.findIndex((x) => x.id === id);
     if (idx < 0) return;
+    if (!skipHistory) this.pushHistory(`delete-${id}`);
     const t = this.tracks[idx];
     this.stopTrackNode(t);
     try {
       t.gain.disconnect();
+      t.filter.disconnect();
       t.panner.disconnect();
+      t.spaceGain.disconnect();
     } catch {
       /* ignore */
     }
@@ -1160,12 +1549,15 @@ export class ProducerMixer {
     this.onChange?.();
   }
 
-  clearAll(): void {
+  clearAll(skipHistory = false): void {
+    if (!skipHistory && this.tracks.length > 0) this.pushHistory("clear-all");
     for (const t of this.tracks) {
       this.stopTrackNode(t);
       try {
         t.gain.disconnect();
+        t.filter.disconnect();
         t.panner.disconnect();
+        t.spaceGain.disconnect();
       } catch {
         /* ignore */
       }
@@ -1222,6 +1614,12 @@ export class ProducerMixer {
     lim.release.value = 0.15;
     loopBus.connect(lim);
     lim.connect(oac.destination);
+    const ambience = oac.createConvolver();
+    ambience.buffer = createAmbienceImpulse(oac);
+    const ambienceWet = oac.createGain();
+    ambienceWet.gain.value = 0.45;
+    ambience.connect(ambienceWet);
+    ambienceWet.connect(oac.destination);
     const anySolo = this.tracks.some((t) => t.solo);
     let any = false;
     for (const t of this.tracks) {
@@ -1236,11 +1634,22 @@ export class ProducerMixer {
       node.loop = true;
       const gn = oac.createGain();
       gn.gain.value = g * t.normGain;
+      const eq = oac.createBiquadFilter();
+      eq.type = "lowpass";
+      eq.frequency.value = toneFrequency(t.tone);
+      eq.Q.value = 0.7;
       const pn = oac.createStereoPanner();
       pn.pan.value = t.pan;
+      const send = oac.createGain();
+      send.gain.value = t.space;
       node.connect(gn);
-      gn.connect(pn);
+      gn.connect(eq);
+      eq.connect(pn);
       pn.connect(t.kind === "loop" ? loopBus : oac.destination);
+      if (t.space > 0) {
+        pn.connect(send);
+        send.connect(ambience);
+      }
       const readOffset =
         t.offsetSec > 0 && this.loopDur > 0
           ? wrapBufferOffset(t.offsetSec, this.loopDur)
@@ -1265,7 +1674,7 @@ export class ProducerMixer {
     this.cycleMode = false;
     this.cycleBuf = null;
     this.teardownCapture();
-    this.clearAll();
+    this.clearAll(true);
     try {
       this.loopBus.disconnect();
     } catch {
@@ -1273,6 +1682,12 @@ export class ProducerMixer {
     }
     try {
       this.limiter.disconnect();
+    } catch {
+      /* ignore */
+    }
+    try {
+      this.ambience.disconnect();
+      this.ambienceWet.disconnect();
     } catch {
       /* ignore */
     }

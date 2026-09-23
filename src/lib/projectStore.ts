@@ -1,9 +1,29 @@
 import type { MixerProjectSnapshot } from "./producerMixer";
+import { isTrackArrangement, type TrackArrangement } from "./arrangement";
+import { isBassPattern, type BassPattern } from "./bass";
+import {
+  isDrumPatternChoice,
+  normalizeDrumPattern,
+  type DrumPattern,
+  type DrumPatternChoice,
+} from "./drums";
 
 const DB_NAME = "trackstar-studio";
 const DB_VERSION = 1;
 const STORE_NAME = "projects";
 const AUTOSAVE_KEY = "autosave";
+
+/** Drum-panel state: which dropdown entry is selected, plus the user's beat. */
+export interface DrumProjectState {
+  choice: DrumPatternChoice;
+  custom: DrumPattern;
+}
+
+export interface CompositionProjectState {
+  bassOn: boolean;
+  bass: BassPattern;
+  arrangement: TrackArrangement;
+}
 
 export interface TrackstarProject {
   version: 1;
@@ -12,6 +32,10 @@ export interface TrackstarProject {
   bpm: number;
   bars: number;
   mixer: MixerProjectSnapshot;
+  /** Optional: projects saved before the beat sequencer shipped have no drums. */
+  drums?: DrumProjectState;
+  /** Optional custom bassline and bar-by-bar layer arrangement. */
+  composition?: CompositionProjectState;
 }
 
 export function cleanProjectName(value: string): string {
@@ -34,6 +58,28 @@ export function isTrackstarProject(value: unknown): value is TrackstarProject {
     v.mixer.version === 1 &&
     Array.isArray(v.mixer.tracks)
   );
+}
+
+/**
+ * Drum state from a restored project, or null if it is missing or damaged.
+ * Deliberately separate from isTrackstarProject: a corrupt drum pattern should
+ * cost the user their beat, not the recorded audio in the same project.
+ */
+export function sanitizeDrumState(value: unknown): DrumProjectState | null {
+  if (!value || typeof value !== "object") return null;
+  const v = value as Partial<DrumProjectState>;
+  const custom = normalizeDrumPattern(v.custom);
+  if (!isDrumPatternChoice(v.choice) || !custom) return null;
+  return { choice: v.choice, custom };
+}
+
+export function sanitizeCompositionState(value: unknown): CompositionProjectState | null {
+  if (!value || typeof value !== "object") return null;
+  const v = value as Partial<CompositionProjectState>;
+  if (typeof v.bassOn !== "boolean" || !isBassPattern(v.bass) || !isTrackArrangement(v.arrangement)) {
+    return null;
+  }
+  return { bassOn: v.bassOn, bass: v.bass, arrangement: v.arrangement };
 }
 
 function openDatabase(): Promise<IDBDatabase> {

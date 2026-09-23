@@ -1,10 +1,15 @@
 import { describe, it, expect } from "vitest";
 import {
   clampPan,
+  createAmbienceImpulse,
   exportSpanSec,
   exportFrames,
   encodeWavStereo,
   sanitizeTrackName,
+  normalizeTrackColor,
+  ProducerMixer,
+  toneFrequency,
+  vocalTakePan,
 } from "./producerMixer";
 import { effectiveGain } from "./vocalLooper";
 
@@ -18,11 +23,135 @@ describe("clampPan", () => {
   });
 });
 
+function fakeMixerContext(): AudioContext {
+  const param = (value = 0) => ({
+    value,
+    setTargetAtTime(next: number) { this.value = next; },
+  });
+  const node = () => ({ connect() {}, disconnect() {} });
+  return {
+    currentTime: 0,
+    sampleRate: 48000,
+    destination: node(),
+    createGain: () => ({ ...node(), gain: param(1) }),
+    createDynamicsCompressor: () => ({
+      ...node(),
+      threshold: param(),
+      knee: param(),
+      ratio: param(),
+      attack: param(),
+      release: param(),
+    }),
+    createStereoPanner: () => ({ ...node(), pan: param(0) }),
+    createBiquadFilter: () => ({ ...node(), type: "lowpass", frequency: param(20000), Q: param(0.7) }),
+    createConvolver: () => ({ ...node(), buffer: null }),
+    createBuffer: (channels: number, length: number, sampleRate: number) => {
+      const data = Array.from({ length: channels }, () => new Float32Array(length));
+      return {
+        duration: length / sampleRate,
+        sampleRate,
+        numberOfChannels: channels,
+        length,
+        getChannelData: (channel: number) => data[channel],
+      };
+    },
+  } as unknown as AudioContext;
+}
+
+function fakeAudioBuffer(): AudioBuffer {
+  return {
+    duration: 1,
+    sampleRate: 48000,
+    numberOfChannels: 1,
+    length: 48000,
+    getChannelData: () => new Float32Array(48000),
+  } as unknown as AudioBuffer;
+}
+
+describe("mixer edit history", () => {
+  it("undoes and redoes track creation without copying audio buffers", () => {
+    const ctx = fakeMixerContext();
+    const mixer = new ProducerMixer(ctx, ctx.destination);
+    mixer.addImportedTrack(fakeAudioBuffer(), "Guide");
+    expect(mixer.getStates()).toHaveLength(1);
+    expect(mixer.getHistoryState()).toEqual({ canUndo: true, canRedo: false });
+    expect(mixer.undo()).toBe(true);
+    expect(mixer.getStates()).toHaveLength(0);
+    expect(mixer.getHistoryState()).toEqual({ canUndo: false, canRedo: true });
+    expect(mixer.redo()).toBe(true);
+    expect(mixer.getStates()[0].name).toBe("Guide");
+  });
+
+  it("restores region color, tone, space, and comp-pick metadata", () => {
+    const ctx = fakeMixerContext();
+    const mixer = new ProducerMixer(ctx, ctx.destination);
+    const track = mixer.addImportedTrack(fakeAudioBuffer(), "Lead");
+    mixer.clearHistory();
+    mixer.setColor(track.id, "#38bdf8");
+    mixer.setTone(track.id, 0.4);
+    mixer.setSpace(track.id, 0.35);
+    mixer.setFavorite(track.id, true);
+    expect(mixer.getStates()[0]).toMatchObject({
+      color: "#38bdf8",
+      tone: 0.4,
+      space: 0.35,
+      favorite: true,
+    });
+    mixer.undo();
+    expect(mixer.getStates()[0].favorite).toBe(false);
+  });
+});
+
+describe("shared studio ambience", () => {
+  it("creates a decaying stereo impulse", () => {
+    const ctx = fakeMixerContext();
+    const impulse = createAmbienceImpulse(ctx, 1, 2);
+    expect(impulse.numberOfChannels).toBe(2);
+    expect(impulse.length).toBe(48000);
+    const left = impulse.getChannelData(0);
+    const early = Math.abs(left[100]);
+    const late = Math.abs(left[left.length - 100]);
+    expect(early).toBeGreaterThan(late);
+  });
+
+  it("preserves a track's Space send in project snapshots", () => {
+    const ctx = fakeMixerContext();
+    const mixer = new ProducerMixer(ctx, ctx.destination);
+    const track = mixer.addImportedTrack(fakeAudioBuffer(), "Lead");
+    mixer.setSpace(track.id, 0.42);
+    const snapshot = mixer.createSnapshot();
+    expect(snapshot.tracks[0].space).toBe(0.42);
+
+    const restored = new ProducerMixer(ctx, ctx.destination);
+    restored.restoreSnapshot(snapshot);
+    expect(restored.getStates()[0].space).toBe(0.42);
+  });
+});
+
 describe("sanitizeTrackName", () => {
   it("normalizes user labels and rejects empty names", () => {
     expect(sanitizeTrackName("  Lead\u0000 vocal  ")).toBe("Lead  vocal");
     expect(sanitizeTrackName("", "Track 3")).toBe("Track 3");
     expect(sanitizeTrackName("x".repeat(100))).toHaveLength(80);
+  });
+});
+
+describe("GarageBand-style track helpers", () => {
+  it("maps the tone knob perceptually from dark to bright", () => {
+    expect(toneFrequency(0)).toBeCloseTo(500);
+    expect(toneFrequency(1)).toBeCloseTo(20000);
+    expect(toneFrequency(0.5)).toBeGreaterThan(2500);
+  });
+
+  it("spreads vocal stack takes evenly across the stereo field", () => {
+    expect(vocalTakePan(0, 1, 1)).toBe(0);
+    expect([0, 1, 2].map((i) => vocalTakePan(i, 3, 0.6))).toEqual([-0.6, 0, 0.6]);
+    expect(vocalTakePan(20, 3, 5)).toBe(1);
+  });
+
+  it("accepts safe region colors and falls back for damaged saves", () => {
+    expect(normalizeTrackColor("#38bdf8")).toBe("#38bdf8");
+    expect(normalizeTrackColor("red", "#ffd400")).toBe("#ffd400");
   });
 });
 

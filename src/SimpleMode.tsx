@@ -35,9 +35,16 @@ import {
 } from "./lib/arp";
 import {
   DrumMachine,
-  DRUM_PATTERN_NAMES,
-  type DrumPatternName,
+  DRUM_PATTERN_CHOICES,
+  CUSTOM_PATTERN,
+  emptyPattern,
+  resolvePattern,
+  type DrumPattern,
+  type DrumPatternChoice,
 } from "./lib/drums";
+import BeatSequencer from "./BeatSequencer";
+import BassSequencer from "./BassSequencer";
+import { bassPatternFromPreset, type BassPattern } from "./lib/bass";
 import { LandmarkSmoother } from "./lib/smoothing";
 import { Harmonizer } from "./lib/harmonizer";
 import {
@@ -45,6 +52,7 @@ import {
   sourcesForSelection,
   type RecordSource,
   type LoopTrackState,
+  type LooperCycleProgress,
 } from "./lib/vocalLooper";
 import { InputMeter } from "./lib/meter";
 import { InputLevelMeter } from "./InputLevelMeter";
@@ -249,10 +257,16 @@ export default function SimpleMode() {
   // Drum machine + metronome
   const [drumsOn, setDrumsOn] = useState<boolean>(false);
   const [drumPattern, setDrumPattern] =
-    useState<DrumPatternName>("Four-on-floor");
+    useState<DrumPatternChoice>("Four-on-floor");
+  const [customBeat, setCustomBeat] = useState<DrumPattern>(() => emptyPattern(1));
+  const [bassOn, setBassOn] = useState<boolean>(false);
+  const [customBass, setCustomBass] = useState<BassPattern>(() => bassPatternFromPreset("Root pulse", 0, 1));
   const [kickOn, setKickOn] = useState<boolean>(true);
   const [snareOn, setSnareOn] = useState<boolean>(true);
+  const [clapOn, setClapOn] = useState<boolean>(true);
   const [hatOn, setHatOn] = useState<boolean>(true);
+  const [tomOn, setTomOn] = useState<boolean>(true);
+  const [shakerOn, setShakerOn] = useState<boolean>(true);
   const [metronomeOn, setMetronomeOn] = useState<boolean>(false);
 
   // Playability
@@ -280,6 +294,10 @@ export default function SimpleMode() {
   const [loopBars, setLoopBars] = useState<number>(2);
   const [loopFree, setLoopFree] = useState<boolean>(false);
   const [loopCountIn, setLoopCountIn] = useState<boolean>(true);
+  const [loopCycleOn, setLoopCycleOn] = useState<boolean>(true);
+  const [loopStackTakes, setLoopStackTakes] = useState<number>(3);
+  const [loopCycleProgress, setLoopCycleProgress] =
+    useState<LooperCycleProgress | null>(null);
   const [loopRecording, setLoopRecording] = useState<boolean>(false);
   const [loopPlaying, setLoopPlaying] = useState<boolean>(false);
   const [loopTracks, setLoopTracks] = useState<LoopTrackState[]>([]);
@@ -363,6 +381,13 @@ export default function SimpleMode() {
   }, [volume]);
 
   // Sound-config editing helpers.
+  // Sounding drum step for the sequencer playhead; stable so the sequencer's
+  // rAF loop survives re-renders.
+  const getDrumPlayhead = useCallback(
+    () => drumsRef.current?.playheadStep() ?? -1,
+    []
+  );
+
   const updateSound = useCallback((mut: (s: SoundConfig) => void) => {
     setSound((prev) => {
       const next = cloneSound(prev);
@@ -397,18 +422,26 @@ export default function SimpleMode() {
     const dm = drumsRef.current;
     if (!dm) return;
     dm.setBpm(arpBpm);
-    dm.setPattern(drumPattern);
-    dm.setEnables({ kick: kickOn, snare: snareOn, hat: hatOn });
+    dm.setPattern(resolvePattern(drumPattern, customBeat));
+    dm.setBassPattern(customBass);
+    dm.setBassEnabled(bassOn);
+    dm.setEnables({ kick: kickOn, snare: snareOn, clap: clapOn, hat: hatOn, tom: tomOn, shaker: shakerOn });
     dm.setMetronome(metronomeOn);
-    const shouldRun = drumsOn || metronomeOn;
+    const shouldRun = drumsOn || bassOn || metronomeOn;
     if (shouldRun && !dm.isRunning) dm.start();
     else if (!shouldRun && dm.isRunning) dm.stop();
   }, [
     drumsOn,
+    bassOn,
     drumPattern,
+    customBeat,
+    customBass,
     kickOn,
     snareOn,
+    clapOn,
     hatOn,
+    tomOn,
+    shakerOn,
     metronomeOn,
     arpBpm,
   ]);
@@ -572,14 +605,20 @@ export default function SimpleMode() {
         drumsRef.current = new DrumMachine(audioCtx, {
           kick: (t) => s.triggerKick(t),
           snare: (t) => s.triggerSnare(t),
+          clap: (t) => s.triggerClap(t),
           hat: (t) => s.triggerHat(t),
+          tom: (t) => s.triggerTom(t),
+          shaker: (t) => s.triggerShaker(t),
+          bass: (midi, t, gate) => s.triggerBass(midi, t, gate),
           click: (t, accent) => s.triggerClick(t, accent),
         });
         drumsRef.current.setBpm(arpBpm);
-        drumsRef.current.setPattern(drumPattern);
-        drumsRef.current.setEnables({ kick: kickOn, snare: snareOn, hat: hatOn });
+        drumsRef.current.setPattern(resolvePattern(drumPattern, customBeat));
+        drumsRef.current.setBassPattern(customBass);
+        drumsRef.current.setBassEnabled(bassOn);
+        drumsRef.current.setEnables({ kick: kickOn, snare: snareOn, clap: clapOn, hat: hatOn, tom: tomOn, shaker: shakerOn });
         drumsRef.current.setMetronome(metronomeOn);
-        if (drumsOn || metronomeOn) drumsRef.current.start();
+        if (drumsOn || bassOn || metronomeOn) drumsRef.current.start();
       }
       if (audioCtx && !looperRef.current) {
         const s = synthRef.current;
@@ -600,6 +639,7 @@ export default function SimpleMode() {
           setLoopTracks(lp.getStates());
           setLoopRecording(lp.isRecording);
           setLoopPlaying(lp.isPlaying);
+          setLoopCycleProgress(lp.getCycleProgress());
         };
       }
       for (const sm of smoothersRef.current) sm.setAmount(smoothing);
@@ -648,11 +688,17 @@ export default function SimpleMode() {
     arpOctaves,
     arpGate,
     drumPattern,
+    customBeat,
+    customBass,
     kickOn,
     snareOn,
+    clapOn,
     hatOn,
+    tomOn,
+    shakerOn,
     metronomeOn,
     drumsOn,
+    bassOn,
     smoothing,
     loopBars,
     loopFree,
@@ -926,8 +972,22 @@ export default function SimpleMode() {
       return;
     }
     updateMeterInputs(loopSource);
-    lp.arm(loopCountIn ? 1 : 0);
-  }, [loopSource, arpBpm, loopBars, loopFree, loopCountIn, getSharedMic, updateMeterInputs]);
+    if (loopCycleOn && !loopFree) {
+      lp.armCycle(loopCountIn ? 1 : 0, loopStackTakes);
+    } else {
+      lp.arm(loopCountIn ? 1 : 0);
+    }
+  }, [
+    loopSource,
+    arpBpm,
+    loopBars,
+    loopFree,
+    loopCountIn,
+    loopCycleOn,
+    loopStackTakes,
+    getSharedMic,
+    updateMeterInputs,
+  ]);
 
   const downloadTake = useCallback((id: number) => {
     const lp = looperRef.current;
@@ -1010,7 +1070,7 @@ export default function SimpleMode() {
 
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_340px]">
         {/* Stage */}
-        <div className="relative">
+        <div className="relative min-w-0">
           <div
             className="relative aspect-video w-full overflow-hidden rounded-2xl border-2 border-magenta bg-ink"
             style={{ boxShadow: "0 0 24px rgba(208,0,255,0.35)" }}
@@ -1141,7 +1201,7 @@ export default function SimpleMode() {
         </div>
 
         {/* Controls + legend */}
-        <aside className="flex flex-col gap-4">
+        <aside className="min-w-0 flex flex-col gap-4">
           {/* Mode switch */}
           <section className="rounded-2xl border border-magenta/30 bg-purple/15 p-4">
             <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-white/70">
@@ -1871,6 +1931,14 @@ export default function SimpleMode() {
                     />
                     Metronome
                   </label>
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={bassOn}
+                      onChange={(e) => setBassOn(e.target.checked)}
+                    />
+                    Bass
+                  </label>
                 </div>
 
                 <label className="mb-3 block text-sm">
@@ -1878,17 +1946,66 @@ export default function SimpleMode() {
                   <select
                     value={drumPattern}
                     onChange={(e) =>
-                      setDrumPattern(e.target.value as DrumPatternName)
+                      setDrumPattern(e.target.value as DrumPatternChoice)
                     }
                     className="w-full rounded-lg border border-purple/50 bg-purple/25 px-2 py-1.5"
                   >
-                    {DRUM_PATTERN_NAMES.map((n) => (
+                    {DRUM_PATTERN_CHOICES.map((n) => (
                       <option key={n} value={n}>
-                        {n}
+                        {n === CUSTOM_PATTERN ? "Custom (my beat)" : n}
                       </option>
                     ))}
                   </select>
                 </label>
+
+                <details className="mb-3" open={drumPattern === CUSTOM_PATTERN}>
+                  <summary className="cursor-pointer list-none text-xs font-semibold uppercase tracking-wide text-white/55">
+                    Beat sequencer
+                  </summary>
+                  <div className="mt-2">
+                    <BeatSequencer
+                      pattern={customBeat}
+                      onChange={(next) => {
+                        setCustomBeat(next);
+                        setDrumPattern(CUSTOM_PATTERN);
+                      }}
+                      getPlayhead={getDrumPlayhead}
+                      enables={{
+                        kick: kickOn,
+                        snare: snareOn,
+                        clap: clapOn,
+                        hat: hatOn,
+                        tom: tomOn,
+                        shaker: shakerOn,
+                      }}
+                      running={drumsOn && drumPattern === CUSTOM_PATTERN}
+                    />
+                    {drumPattern !== CUSTOM_PATTERN && (
+                      <p className="mt-1 text-[11px] text-white/45">
+                        Editing here switches the pattern to Custom.
+                      </p>
+                    )}
+                  </div>
+                </details>
+
+                <details className="mb-3" open={bassOn}>
+                  <summary className="cursor-pointer list-none text-xs font-semibold uppercase tracking-wide text-cyan-200">
+                    Bass sequencer
+                  </summary>
+                  <div className="mt-2">
+                    <BassSequencer
+                      pattern={customBass}
+                      onChange={(next) => {
+                        setCustomBass(next);
+                        setBassOn(true);
+                      }}
+                      tonic={tonic}
+                      scale={scale}
+                      getPlayhead={getDrumPlayhead}
+                      running={bassOn}
+                    />
+                  </div>
+                </details>
 
                 <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-white/55">
                   Instruments
@@ -1913,10 +2030,34 @@ export default function SimpleMode() {
                   <label className="flex items-center gap-2">
                     <input
                       type="checkbox"
+                      checked={clapOn}
+                      onChange={(e) => setClapOn(e.target.checked)}
+                    />
+                    Clap
+                  </label>
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
                       checked={hatOn}
                       onChange={(e) => setHatOn(e.target.checked)}
                     />
                     Hi-hat
+                  </label>
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={tomOn}
+                      onChange={(e) => setTomOn(e.target.checked)}
+                    />
+                    Tom
+                  </label>
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={shakerOn}
+                      onChange={(e) => setShakerOn(e.target.checked)}
+                    />
+                    Shaker
                   </label>
                 </div>
 
@@ -2128,6 +2269,87 @@ export default function SimpleMode() {
                   </label>
                 </div>
 
+                {/* Continuous vocal-stack capture */}
+                <fieldset className="mb-3 rounded-xl border border-magenta/25 bg-ink/20 p-3">
+                  <label className="flex items-start gap-2">
+                    <input
+                      type="checkbox"
+                      checked={loopCycleOn}
+                      disabled={loopFree || loopRecording}
+                      onChange={(e) => setLoopCycleOn(e.target.checked)}
+                      className="mt-0.5"
+                    />
+                    <span>
+                      <span className="block text-sm font-medium text-white/90">
+                        Continuous vocal stack
+                      </span>
+                      <span className="block text-[11px] leading-4 text-white/50">
+                        Record one take per loop pass and stop automatically.
+                      </span>
+                    </span>
+                  </label>
+                  <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+                    <label htmlFor="loop-stack-takes" className="text-white/65">
+                      Stack size
+                    </label>
+                    <select
+                      id="loop-stack-takes"
+                      aria-label="Vocal stack size"
+                      value={loopStackTakes}
+                      disabled={!loopCycleOn || loopFree || loopRecording}
+                      onChange={(e) => setLoopStackTakes(Number(e.target.value))}
+                      className="rounded-md border border-purple/50 bg-purple/30 px-2 py-1 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      {[2, 3, 4, 6].map((takes) => (
+                        <option key={takes} value={takes}>
+                          {takes} takes
+                        </option>
+                      ))}
+                    </select>
+                    {loopFree && (
+                      <span className="text-orange/80">
+                        Choose a fixed loop length to stack passes.
+                      </span>
+                    )}
+                  </div>
+
+                  {loopCycleProgress && loopCycleProgress.target > 0 && (
+                    <div
+                      className="mt-3"
+                      role="status"
+                      aria-label={`${loopCycleProgress.recorded} of ${loopCycleProgress.target} vocal takes recorded`}
+                    >
+                      <div className="mb-1 flex items-center justify-between text-[11px]">
+                        <span className="text-white/60">
+                          {loopCycleProgress.active
+                            ? loopCycleProgress.recorded === 0
+                              ? "Count-in / waiting for loop boundary"
+                              : "Capturing next pass"
+                            : "Stack complete"}
+                        </span>
+                        <span className="font-semibold text-yellow">
+                          {loopCycleProgress.recorded}/{loopCycleProgress.target}
+                        </span>
+                      </div>
+                      <div className="grid grid-flow-col gap-1" aria-hidden="true">
+                        {Array.from({ length: loopCycleProgress.target }, (_, i) => (
+                          <span
+                            key={i}
+                            className={`h-1.5 rounded-full ${
+                              i < loopCycleProgress.recorded
+                                ? "bg-yellow"
+                                : loopCycleProgress.active &&
+                                    i === loopCycleProgress.recorded
+                                  ? "animate-pulse bg-orange"
+                                  : "bg-purple/45"
+                            }`}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </fieldset>
+
                 {/* Transport */}
                 <div className="mb-3 flex flex-wrap gap-2">
                   <button
@@ -2141,7 +2363,13 @@ export default function SimpleMode() {
                           : "bg-magenta text-ink hover:bg-magenta/80"
                     }`}
                   >
-                    {loopRecording ? "Stop take" : "Record take"}
+                    {loopRecording
+                      ? loopCycleOn && !loopFree
+                        ? "Stop stack"
+                        : "Stop take"
+                      : loopCycleOn && !loopFree
+                        ? `Record ${loopStackTakes}-pass stack`
+                        : "Record take"}
                   </button>
                   <button
                     onClick={() =>
@@ -2174,8 +2402,8 @@ export default function SimpleMode() {
                 {/* Track list */}
                 {loopTracks.length === 0 ? (
                   <p className="text-xs text-white/55">
-                    No loops yet. Record a take to start a stack, then record
-                    more takes on top to build harmonies.
+                    No loops yet. Record a continuous stack to capture several
+                    phase-locked vocal passes without touching the controls.
                   </p>
                 ) : (
                   <ul className="flex flex-col gap-2">

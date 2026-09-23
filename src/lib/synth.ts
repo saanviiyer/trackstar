@@ -666,6 +666,40 @@ export class Synth {
   // --- Synthesized drum voices (route to the drum bus, dry, so they are
   // recorded but not colored by the synth filter/effects). ---
 
+  triggerBass(midi: number, t0: number, gate: number): void {
+    if (!this.ctx || !this.drumBus) return;
+    const ctx = this.ctx;
+    const t = Math.max(t0, ctx.currentTime);
+    const frequency = 440 * Math.pow(2, (midi - 69) / 12);
+    const osc = ctx.createOscillator();
+    const sub = ctx.createOscillator();
+    osc.type = "sawtooth";
+    sub.type = "sine";
+    osc.frequency.setValueAtTime(frequency, t);
+    sub.frequency.setValueAtTime(frequency / 2, t);
+    const filter = ctx.createBiquadFilter();
+    filter.type = "lowpass";
+    filter.frequency.setValueAtTime(720, t);
+    filter.frequency.exponentialRampToValueAtTime(180, t + Math.max(0.04, gate));
+    filter.Q.value = 1.8;
+    const subGain = ctx.createGain();
+    subGain.gain.value = 0.38;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.46, t + 0.008);
+    g.gain.exponentialRampToValueAtTime(0.18, t + Math.min(0.1, gate * 0.5));
+    g.gain.exponentialRampToValueAtTime(0.0001, t + Math.max(0.04, gate));
+    osc.connect(filter);
+    sub.connect(subGain);
+    subGain.connect(filter);
+    filter.connect(g);
+    g.connect(this.drumBus);
+    osc.start(t);
+    sub.start(t);
+    osc.stop(t + Math.max(0.05, gate) + 0.02);
+    sub.stop(t + Math.max(0.05, gate) + 0.02);
+  }
+
   triggerKick(t0: number): void {
     if (!this.ctx || !this.drumBus) return;
     const ctx = this.ctx;
@@ -715,6 +749,30 @@ export class Synth {
     osc.stop(t + 0.12);
   }
 
+  triggerClap(t0: number): void {
+    if (!this.ctx || !this.drumBus) return;
+    const ctx = this.ctx;
+    const t = Math.max(t0, ctx.currentTime);
+    const src = ctx.createBufferSource();
+    src.buffer = this.noise();
+    const bp = ctx.createBiquadFilter();
+    bp.type = "bandpass";
+    bp.frequency.value = 1500;
+    bp.Q.value = 0.7;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    for (const offset of [0, 0.018, 0.036]) {
+      g.gain.setValueAtTime(0.65, t + offset);
+      g.gain.exponentialRampToValueAtTime(0.08, t + offset + 0.012);
+    }
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.16);
+    src.connect(bp);
+    bp.connect(g);
+    g.connect(this.drumBus);
+    src.start(t);
+    src.stop(t + 0.18);
+  }
+
   triggerHat(t0: number): void {
     if (!this.ctx || !this.drumBus) return;
     const ctx = this.ctx;
@@ -732,6 +790,43 @@ export class Synth {
     g.connect(this.drumBus);
     src.start(t);
     src.stop(t + 0.06);
+  }
+
+  triggerTom(t0: number): void {
+    if (!this.ctx || !this.drumBus) return;
+    const ctx = this.ctx;
+    const t = Math.max(t0, ctx.currentTime);
+    const osc = ctx.createOscillator();
+    osc.type = "sine";
+    osc.frequency.setValueAtTime(190, t);
+    osc.frequency.exponentialRampToValueAtTime(105, t + 0.18);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.65, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.28);
+    osc.connect(g);
+    g.connect(this.drumBus);
+    osc.start(t);
+    osc.stop(t + 0.3);
+  }
+
+  triggerShaker(t0: number): void {
+    if (!this.ctx || !this.drumBus) return;
+    const ctx = this.ctx;
+    const t = Math.max(t0, ctx.currentTime);
+    const src = ctx.createBufferSource();
+    src.buffer = this.noise();
+    const bp = ctx.createBiquadFilter();
+    bp.type = "bandpass";
+    bp.frequency.value = 9000;
+    bp.Q.value = 1.2;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.2, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.09);
+    src.connect(bp);
+    bp.connect(g);
+    g.connect(this.drumBus);
+    src.start(t);
+    src.stop(t + 0.1);
   }
 
   triggerClick(t0: number, accent: boolean): void {

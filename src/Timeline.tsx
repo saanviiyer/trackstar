@@ -30,6 +30,7 @@ interface TimelineProps {
 }
 
 type DragMode = "move" | "trim-l" | "trim-r";
+type SnapMode = "off" | "beat" | "bar";
 interface DragState {
   id: number;
   mode: DragMode;
@@ -96,9 +97,18 @@ export default function Timeline({
   const laneAreaRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<DragState | null>(null);
   const loopDragRef = useRef<boolean>(false);
+  const [snapMode, setSnapMode] = useState<SnapMode>("beat");
   // Local live offsets/durations while dragging (avoids restarting audio on
   // every pointermove; the committed value is sent on pointerup).
   const [drafts, setDrafts] = useState<Record<number, { start: number; dur: number }>>({});
+  const snap = useCallback(
+    (seconds: number) => {
+      if (snapMode === "off") return seconds;
+      const unit = snapMode === "bar" ? barSec : barSec / Math.max(1, beatsPerBar);
+      return Math.round(seconds / unit) * unit;
+    },
+    [barSec, beatsPerBar, snapMode]
+  );
 
   // Waveform peaks are expensive to compute, so cache them and only recompute
   // when the track set / loop length / zoom changes (not on every playhead tick).
@@ -151,18 +161,18 @@ export default function Timeline({
       const loop = loopDurSec > 0 ? loopDurSec : d.origDur;
       if (d.mode === "move") {
         const maxStart = Math.max(0, loop - d.origDur);
-        const start = Math.max(0, Math.min(maxStart, d.origStart + deltaSec));
+        const start = Math.max(0, Math.min(maxStart, snap(d.origStart + deltaSec)));
         setDrafts((prev) => ({ ...prev, [d.id]: { start, dur: d.origDur } }));
       } else if (d.mode === "trim-l") {
-        const start = Math.max(0, Math.min(d.origStart + d.origDur - 0.05, d.origStart + deltaSec));
+        const start = Math.max(0, Math.min(d.origStart + d.origDur - 0.05, snap(d.origStart + deltaSec)));
         const dur = d.origStart + d.origDur - start;
         setDrafts((prev) => ({ ...prev, [d.id]: { start, dur } }));
       } else {
-        const dur = Math.max(0.05, Math.min(loop - d.origStart, d.origDur + deltaSec));
+        const dur = Math.max(0.05, Math.min(loop - d.origStart, snap(d.origDur + deltaSec)));
         setDrafts((prev) => ({ ...prev, [d.id]: { start: d.origStart, dur } }));
       }
     },
-    [pps, loopDurSec]
+    [pps, loopDurSec, snap]
   );
 
   const onPointerUp = useCallback(() => {
@@ -200,14 +210,27 @@ export default function Timeline({
 
   return (
     <div className="rounded-2xl border border-magenta/30 bg-purple/15 p-4">
-      <div className="mb-2 flex items-center justify-between">
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
         <h2 className="text-sm font-semibold uppercase tracking-wide text-white/70">
           Timeline
         </h2>
-        <span className="text-xs text-white/45">
-          Loop: {loopBars} {loopBars === 1 ? "bar" : "bars"}. Drag clips to move,
-          edges to trim, the yellow handle to resize the loop.
-        </span>
+        <div className="flex flex-wrap items-center gap-2 text-xs text-white/45">
+          <span>Loop: {loopBars} {loopBars === 1 ? "bar" : "bars"}</span>
+          <span className="text-white/30">Snap</span>
+          {(["off", "beat", "bar"] as SnapMode[]).map((mode) => (
+            <button
+              key={mode}
+              type="button"
+              onClick={() => setSnapMode(mode)}
+              aria-pressed={snapMode === mode}
+              className={`rounded px-2 py-0.5 capitalize ${
+                snapMode === mode ? "bg-yellow text-ink" : "bg-purple/30 text-white/70"
+              }`}
+            >
+              {mode}
+            </button>
+          ))}
+        </div>
       </div>
 
       <div
@@ -277,14 +300,11 @@ export default function Timeline({
               const dur = clipDur(t);
               const x = start * pps;
               const w = Math.max(6, dur * pps);
-              const isLoop = t.kind === "loop";
               const peaks = peaksMap[t.id] ?? [];
               const clipColor = t.muted
                 ? "rgba(255,159,28,0.35)"
-                : isLoop
-                  ? "rgba(255,212,0,0.30)"
-                  : "rgba(208,0,255,0.28)";
-              const waveColor = isLoop ? "#ffd400" : "#ff9f1c";
+                : `${t.color}${t.kind === "loop" ? "55" : "44"}`;
+              const waveColor = t.color;
               return (
                 <div
                   key={t.id}
@@ -317,7 +337,7 @@ export default function Timeline({
                     title={`${t.name}, drag to move`}
                   >
                     <div className="pointer-events-none absolute left-1 top-0.5 z-10 max-w-full truncate pr-1 text-[10px] font-medium text-ink">
-                      {t.name}
+                      {t.favorite ? "★ " : ""}{t.name}
                     </div>
                     <Waveform peaks={peaks} width={w} height={LANE_H - 8} color={waveColor} />
                     {/* Trim handles */}
